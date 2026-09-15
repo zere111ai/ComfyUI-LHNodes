@@ -420,7 +420,7 @@ app.registerExtension({
 
         app.queuePrompt = async function(number, batchCount) {
             const sqrNodes = (app.graph?.nodes || []).filter(n =>
-                (n.type === "WanAniSQRSegmentQueue" || n.type === "WanAniDirector") && !n.muted && n.mode !== 4
+                (n.type === "WanAniSQRSegmentQueue" || n.type === "WanAniDirector" || n.type === "WanAni2Director") && !n.muted && n.mode !== 4
             );
             if (sqrNodes.length === 0) {
                 return origQueuePrompt(number, batchCount);

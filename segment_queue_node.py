@@ -6,6 +6,7 @@ import math, copy, json, time, os, threading, urllib.request, urllib.error, hash
 import server, folder_paths
 from aiohttp import web
 from comfy.cli_args import args
+from comfy_execution.utils import CurrentNodeContext
 
 # ── 日志缓冲（前端弹窗读取）──────────────────────────────────────
 _sqr_log_buf: dict = {}
@@ -86,11 +87,15 @@ def parse_director_plan(director_data, total_frames: int) -> list:
         if not isinstance(raw, dict) or not _sqr_to_bool(raw.get("enabled", True), True):
             continue
         start = max(0, _sqr_to_int(raw.get("start"), previous_end))
-        end = min(max(0, int(total_frames)), _sqr_to_int(raw.get("end"), start + 1))
+        raw_end = _sqr_to_int(raw.get("end"), start + 1)
+        if raw_end > max(0, int(total_frames)):
+            raise ValueError(f"Director 第 {index + 1} 段超出当前视频总帧数: {raw_end}>{total_frames}")
+        end = max(0, raw_end)
         if end <= start:
             raise ValueError(f"Director 第 {index + 1} 段范围无效: {start}-{end}")
-        if result and start < previous_end:
-            raise ValueError(f"Director 第 {index + 1} 段与上一段重叠")
+        if start != previous_end:
+            relation = "重叠" if start < previous_end else "存在空洞"
+            raise ValueError(f"Director 第 {index + 1} 段与上一段{relation}: {previous_end}-{start}")
         visible_length = end - start
         # Wan video latents use 4n+1 frame windows.  Read/generate the smallest
         # compatible window, then crop back to the exact hand-authored range.
@@ -107,6 +112,8 @@ def parse_director_plan(director_data, total_frames: int) -> list:
         previous_end = end
     if not result:
         raise ValueError("Director 没有可执行的有效分段")
+    if previous_end != max(0, int(total_frames)):
+        raise ValueError(f"Director 时间线未覆盖完整视频: {previous_end}/{total_frames} 帧")
     return result
 
 
@@ -207,36 +214,6 @@ def first_director_guide_path(director_data) -> str:
     return ""
 
 
-def first_director_color_match_config(director_data) -> dict:
-    """Resolve the first guide segment and its first reference/color settings."""
-    try:
-        data = json.loads(director_data) if isinstance(director_data, str) else director_data
-    except Exception:
-        data = {}
-    segments = data.get("segments", []) if isinstance(data, dict) else []
-    for segment in segments:
-        if not isinstance(segment, dict):
-            continue
-        guide = segment.get("guide_frame")
-        guide_path = guide.get("path", "") if isinstance(guide, dict) else str(guide or "")
-        if not guide_path or not os.path.isfile(_sqr_resolve_media_path(guide_path) or ""):
-            continue
-        references = segment.get("references", [])
-        first_ref = references[0] if isinstance(references, list) and references else ""
-        ref_path = _sqr_ref_entry_path(first_ref)
-        if ref_path and not os.path.isfile(_sqr_resolve_media_path(ref_path) or ""):
-            ref_path = ""
-        ref_strength = first_ref.get("color_match_strength") if isinstance(first_ref, dict) else None
-        strength_value = ref_strength if ref_strength is not None else segment.get("color_match_strength", 1.0)
-        return {
-            "guide_path": guide_path,
-            "reference_path": ref_path,
-            "enabled": _sqr_to_bool(segment.get("color_match", False)),
-            "strength": max(0.0, min(10.0, float(strength_value if strength_value is not None else 1.0))),
-        }
-    return {"guide_path": "", "reference_path": "", "enabled": False, "strength": 1.0}
-
-
 def _sqr_color_match_tensor(image_target, image_ref, strength=1.0):
     """Apply ColorMatchV2's default MKL method and strength formula."""
     import torch
@@ -266,14 +243,10 @@ def load_first_director_guide_frame(director_data):
     """Return the first extracted Director scale-guide frame as an IMAGE tensor."""
     import torch
 
-    config = first_director_color_match_config(director_data)
-    guide_path = _sqr_resolve_media_path(config["guide_path"]) if config["guide_path"] else None
+    guide = first_director_guide_path(director_data)
+    guide_path = _sqr_resolve_media_path(guide) if guide else None
     if guide_path and os.path.isfile(guide_path):
-        guide = _sqr_load_image_tensor(guide_path)
-        ref_path = _sqr_resolve_media_path(config["reference_path"]) if config["reference_path"] else None
-        if config["enabled"] and ref_path and os.path.isfile(ref_path):
-            return _sqr_color_match_tensor(_sqr_load_image_tensor(ref_path), guide, config["strength"])
-        return guide
+        return _sqr_load_image_tensor(guide_path)
     # Keep the IMAGE socket valid before any guide frame has been extracted.
     return torch.zeros((1, 1, 1, 3), dtype=torch.float32)
 
@@ -770,7 +743,7 @@ def build_plan_text(total_frames, segments, start_from_segment, node_id, frame_r
 
 def find_video_combine_node(prompt: dict, combine_node_id: str) -> str | None:
     nid = combine_node_id.strip()
-    if nid and nid in prompt:
+    if nid and prompt.get(nid, {}).get("class_type") == "VHS_VideoCombine":
         return nid
     for nid, node in prompt.items():
         if node.get("class_type") == "VHS_VideoCombine":
@@ -805,9 +778,46 @@ def find_latent_source_for_images(prompt: dict, image_src_node):
     return None
 
 
+def find_frame_interpolate_for_images(prompt: dict, image_src_node):
+    """Find an upstream FrameInterpolate through a simple single-image chain."""
+    current = image_src_node
+    visited = set()
+    while isinstance(current, list) and len(current) == 2:
+        nid = str(current[0])
+        if nid in visited:
+            break
+        visited.add(nid)
+        node = prompt.get(nid, {})
+        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+        if node.get("class_type") == "FrameInterpolate":
+            source = inputs.get("images")
+            return (nid, source) if isinstance(source, list) and len(source) == 2 else (None, None)
+        linked = [inputs.get(name) for name in ("images", "image", "input")]
+        linked = [value for value in linked if isinstance(value, list) and len(value) == 2]
+        if len(linked) != 1:
+            break
+        current = linked[0]
+    return None, None
+
+
+def upstream_node_ids(prompt: dict, node_ids) -> set[str]:
+    pending = [str(nid) for nid in node_ids if str(nid) in prompt]
+    found = set(pending)
+    while pending:
+        node = prompt.get(pending.pop(), {})
+        for value in (node.get("inputs", {}) if isinstance(node, dict) else {}).values():
+            if not (isinstance(value, list) and len(value) == 2):
+                continue
+            source_id = str(value[0])
+            if source_id in prompt and source_id not in found:
+                found.add(source_id)
+                pending.append(source_id)
+    return found
+
+
 def find_animate_embeds_node(prompt: dict) -> str | None:
     for nid, node in prompt.items():
-        if node.get("class_type") in ("WanVideoAnimateEmbeds", "WanAnimateToVideo", "SQRWanAnimateTransitionToVideo", "SQRSCAIL2TransitionToVideo"):
+        if node.get("class_type") in ("WanVideoAnimateEmbeds", "WanAnimateToVideo", "WanAnimate2ToVideo", "SQRWanAnimateTransitionToVideo", "SQRSCAIL2TransitionToVideo"):
             return nid
     for nid, node in prompt.items():
         inputs = node.get("inputs", {})
@@ -826,15 +836,13 @@ def find_multi_reference_node(prompt: dict) -> str | None:
 def find_driving_sam3_node(prompt: dict, video_node_id: str) -> str | None:
     """Find the SAM3 tracker whose image input comes from the driving video."""
     source_id = str(video_node_id)
-    fallback = None
     for nid, node in prompt.items():
         if node.get("class_type") != "SAM3_VideoTrack":
             continue
-        fallback = fallback or str(nid)
         images = node.get("inputs", {}).get("images")
         if isinstance(images, list) and len(images) == 2 and str(images[0]) == source_id:
             return str(nid)
-    return fallback
+    return None
 
 
 def media_has_audio(path: str | None) -> bool:
@@ -918,7 +926,7 @@ def _sqr_node_supports_transition(prompt: dict, node_id: str) -> tuple[bool, str
     node = prompt.get(node_id, {}) if node_id else {}
     class_type = node.get("class_type", "") if isinstance(node, dict) else ""
     inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
-    supported = class_type in ("WanVideoAnimateEmbeds", "SQRWanAnimateTransitionToVideo", "SQRSCAIL2TransitionToVideo")
+    supported = class_type in ("WanVideoAnimateEmbeds", "WanAnimate2ToVideo", "SQRWanAnimateTransitionToVideo", "SQRSCAIL2TransitionToVideo")
     if not supported and isinstance(inputs, dict) and "transition_video" in inputs:
         supported = True
     return supported, class_type
@@ -934,7 +942,12 @@ def queue_prompt(workflow, host=None, client_id="") -> str:
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())["prompt_id"]
+                result = json.loads(resp.read())
+            if result.get("node_errors"):
+                raise ValueError(f"分段工作流验证失败: {json.dumps(result['node_errors'], ensure_ascii=False)}")
+            return result["prompt_id"]
+        except ValueError:
+            raise
         except Exception as e:
             last_err = e
     raise last_err
@@ -949,10 +962,10 @@ def wait_for_prompt(prompt_id, host=None, poll=5) -> bool:
                     history = json.loads(resp.read())
                 if prompt_id in history:
                     st = history[prompt_id].get("status", {})
-                    if st.get("completed"):
-                        return True
                     if st.get("status_str") == "error":
                         return False
+                    if st.get("completed"):
+                        return True
                     break
             except Exception:
                 continue
@@ -1048,12 +1061,16 @@ MULTI_REF_STARTUP_TRIM_FRAMES = 9
 
 
 def _sqr_transition_frame_count(class_type: str) -> int:
+    if class_type == "WanAnimate2ToVideo":
+        return 1
     if class_type == "SQRSCAIL2TransitionToVideo":
         return SCAIL2_TRANSITION_FRAMES
     return TRANSITION_FRAMES
 
 
 def _sqr_transition_added_frames(class_type: str) -> int:
+    if class_type == "WanAnimate2ToVideo":
+        return 1
     if class_type == "SQRSCAIL2TransitionToVideo":
         return SCAIL2_TRANSITION_FRAMES - 1
     return TRANSITION_FRAMES
@@ -1287,6 +1304,8 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None,
 
 
 class SegmentQueueRunner:
+    REQUIRE_POSITIVE_PROMPT = True
+    ANIMATE_NODE_TYPE = None
     CATEGORY = "video/utils"
     FUNCTION = "run"
     OUTPUT_NODE = True
@@ -1383,18 +1402,16 @@ class SegmentQueueRunner:
         director_base_prompts = []
         director_prompts = []
         director_guide_path = ""
-        director_color_config = {"enabled": False, "reference_path": "", "strength": 1.0}
         if director_data and str(director_data).strip() not in ("", "{}"):
             try:
                 director_plan = parse_director_plan(director_data, _plan_frames)
                 director_base_prompts = resolve_director_prompts(director_data)
                 director_prompts = resolve_director_composed_prompts(director_data)
                 director_guide_path = first_director_guide_path(director_data)
-                director_color_config = first_director_color_match_config(director_data)
             except ValueError as exc:
                 _sqr_log(unique_id, f"[SQR] ✗ {exc}")
                 return {}
-            if director_plan and (not director_base_prompts or not director_base_prompts[0]):
+            if self.REQUIRE_POSITIVE_PROMPT and director_plan and (not director_base_prompts or not director_base_prompts[0]):
                 _sqr_log(unique_id, "[SQR] ✗ Director 第一段必须填写 positive 提示词。")
                 return {}
 
@@ -1474,30 +1491,17 @@ class SegmentQueueRunner:
         segs_to_run = seg_list[start_idx:]
         base_prompt = copy.deepcopy(_effective_prompt)
 
-        for _node in base_prompt.values():
-            if not isinstance(_node, dict):
-                continue
-            if _node.get("class_type") in ("SQRScail2ColoredMaskAdvanced", "SQRSCAIL2TransitionToVideo"):
-                _node.setdefault("inputs", {})["replacement_mode"] = replacement_enabled
-            if _node.get("class_type") == "SQRSCAIL2TransitionToVideo":
-                # Director/SCAIL-2 segmented video execution is one timeline at
-                # a time. Some saved workflows may accidentally keep a sampler
-                # context/window value in this slot (for example 20), which
-                # would create a batched latent and make ComfyUI context-window
-                # conditioning index out of range. Normalize it before each
-                # queued segment is submitted; the transition node also keeps a
-                # runtime guard as a last-resort safety net.
-                _node.setdefault("inputs", {})["batch_size"] = 1
-            if _node.get("class_type") == "SQRScail2ColoredMaskAdvanced":
-                _inputs = _node.setdefault("inputs", {})
-                current_identity = _inputs.get("identity_mode")
-                if multi_ref_enabled and current_identity == "multi_person_multi_reference":
-                    _inputs["identity_mode"] = "multi_person_multi_reference"
-                else:
-                    _inputs["identity_mode"] = "single_person_multi_reference" if multi_ref_enabled else "multi_person"
-
         ae_nid = ae_node_id or find_animate_embeds_node(base_prompt) or ""
+        if self.ANIMATE_NODE_TYPE and base_prompt.get(ae_nid, {}).get("class_type") != self.ANIMATE_NODE_TYPE:
+            candidates = [nid for nid, node in base_prompt.items() if node.get("class_type") == self.ANIMATE_NODE_TYPE]
+            if len(candidates) != 1:
+                _sqr_log(unique_id, f"[SQR] ✗ 请将动作嵌入节点ID设置为当前 {self.ANIMATE_NODE_TYPE} 节点的ID。")
+                return {}
+            ae_nid = candidates[0]
+            _sqr_log(unique_id, f"[SQR] 动作嵌入节点ID已自动纠正: {ae_node_id or '(空)'} → {ae_nid}")
+        ae_node_id = ae_nid
         vc_nid = find_video_combine_node(base_prompt, combine_nid) or ""
+        director_scope = upstream_node_ids(base_prompt, [vc_nid]) if vc_nid else set()
         driving_sam3_nid = find_driving_sam3_node(base_prompt, node_id) or ""
 
         ref_images_list = []
@@ -1638,19 +1642,18 @@ class SegmentQueueRunner:
             _sqr_log(unique_id, f"[SQR] Load Video 原始 skip_first_frames={main_ref_skip_first}，分段读取会保留这个起始偏移")
 
         image_src_node = None
+        video_output_image_node = None
         frame_interpolate_nid = None
         latent_src_node = None
         if vc_nid and vc_nid in base_prompt:
             img_input = base_prompt[vc_nid]["inputs"].get("images")
             if isinstance(img_input, list) and len(img_input) == 2:
                 image_src_node = img_input
-                output_node = base_prompt.get(str(img_input[0]), {})
-                if output_node.get("class_type") == "FrameInterpolate":
-                    interpolation_input = output_node.get("inputs", {}).get("images")
-                    if isinstance(interpolation_input, list) and len(interpolation_input) == 2:
-                        frame_interpolate_nid = str(img_input[0])
-                        image_src_node = interpolation_input
-                        print(f"[SQR] 帧插值输出: {img_input}，原始图像来源: {image_src_node}")
+                frame_interpolate_nid, interpolation_input = find_frame_interpolate_for_images(base_prompt, img_input)
+                if frame_interpolate_nid:
+                    video_output_image_node = img_input
+                    image_src_node = interpolation_input
+                    print(f"[SQR] 帧插值链输出: {img_input}，原始图像来源: {image_src_node}")
                 print(f"[SQR] 图像来源: {image_src_node}")
                 latent_src_node = find_latent_source_for_images(base_prompt, image_src_node)
                 if latent_src_node:
@@ -1721,8 +1724,10 @@ class SegmentQueueRunner:
                         _prompt_config["character_lock"] = copy.deepcopy(previous_character_lock)
                     seg_positive = compose_director_positive(_prompt_base, _prompt_config)
                 seg_ref_identity_groups, seg_ref_person_count = _sqr_ref_identity_groups(seg_refs, max_refs=6)
-                for _node in wf.values():
+                for _node_id, _node in wf.items():
                     if not isinstance(_node, dict):
+                        continue
+                    if director_scope and str(_node_id) not in director_scope:
                         continue
                     if _node.get("class_type") in ("SQRScail2ColoredMaskAdvanced", "SQRSCAIL2TransitionToVideo"):
                         _node.setdefault("inputs", {})["replacement_mode"] = seg_replacement
@@ -1779,7 +1784,8 @@ class SegmentQueueRunner:
                     if startup_trim_reason:
                         startup_trim_frames = MULTI_REF_STARTUP_TRIM_FRAMES
                         log(f"  Multi Ref startup fix: repeat_prefix={startup_trim_frames} trim_after_prefix={startup_trim_frames} reason={startup_trim_reason}")
-                _transition_frames_for_load = 0
+                _wan_animate2 = _ae_class_type == "WanAnimate2ToVideo"
+                _transition_frames_for_load = 1 if _wan_animate2 and use_transition else 0
                 _video_skip = max(0, _actual_skip - _transition_frames_for_load)
                 _video_limit = limit + (_actual_skip - _video_skip)
                 if _frame_offset > 0:
@@ -1791,6 +1797,14 @@ class SegmentQueueRunner:
 
                 wf[node_id]["inputs"]["skip_first_frames"] = main_ref_skip_first + _video_skip
                 wf[node_id]["inputs"]["frame_load_cap"]    = _video_limit
+                if _wan_animate2:
+                    source_stride = max(1, int(wf[node_id]["inputs"].get("select_every_nth", 1)))
+                    wf[node_id]["inputs"]["skip_first_frames"] = main_ref_skip_first + _video_skip * source_stride
+                    animate_inputs = wf[ae_nid]["inputs"]
+                    # Include the anchor, round up to 4n+1, then crop to the edit range.
+                    animate_inputs["length"] = ((visible_limit + int(use_transition) + 2) // 4) * 4 + 1
+                    animate_inputs["video_frame_offset"] = int(use_transition)
+                    animate_inputs["batch_size"] = 1
                 if startup_trim_frames > 0:
                     length_ok, length_note = _sqr_add_to_input_or_linked_value(
                         wf, ae_nid, "length", startup_trim_frames
@@ -1873,6 +1887,8 @@ class SegmentQueueRunner:
 
                 if vc_nid and vc_nid in wf and audio_filename:
                     _real_skip = main_ref_skip_first + skip + _frame_offset
+                    if _wan_animate2:
+                        _real_skip = main_ref_skip_first / source_stride + skip + _frame_offset
                     if use_transition and transition_enabled:
                         audio_skip_frames    = _real_skip
                         main_audio_frames    = max(0, _real_skip - transition_added_frames)
@@ -1954,7 +1970,7 @@ class SegmentQueueRunner:
                                 tv_inputs["custom_height"] = height_src
                             wf[tv_tmp_id] = {"class_type": "VHS_LoadVideo", "inputs": tv_inputs}
                             transition_image_node = [tv_tmp_id, 0]
-                            wf[ae_nid]["inputs"]["transition_video"] = [tv_tmp_id, 0]
+                            wf[ae_nid]["inputs"]["continue_motion" if _wan_animate2 else "transition_video"] = [tv_tmp_id, 0]
                             wf[ae_nid]["inputs"].pop("transition_latent", None)
                             log(f"  ✓ 过渡视频: {os.path.basename(last_video_path)} skip={t_skip} limit={transition_frames}")
                             log(f"  过渡调试: 已注入节点 {tv_tmp_id} -> {ae_nid}.transition_video, inputs={tv_inputs}")
@@ -2053,8 +2069,8 @@ class SegmentQueueRunner:
                             load_id = f"sqr_mref_{seg_num}_{ref_slot}"
                             wf[load_id] = {"class_type": "LoadImage", "inputs": {"image": img_name}}
                             ref_inputs[f"image_{ref_slot}"] = _sqr_color_matched_ref(img_entry, load_id, ref_slot)
-                        for _node in wf.values():
-                            if isinstance(_node, dict) and _node.get("class_type") == "SQRScail2ColoredMaskAdvanced":
+                        for _node_id, _node in wf.items():
+                            if (not director_scope or str(_node_id) in director_scope) and isinstance(_node, dict) and _node.get("class_type") == "SQRScail2ColoredMaskAdvanced":
                                 _mask_inputs = _node.setdefault("inputs", {})
                                 _mask_inputs["background_indices"] = ",".join(str(x) for x in bg_indices)
                                 if seg_ref_identity_groups:
@@ -2076,7 +2092,11 @@ class SegmentQueueRunner:
                             log(f"  ! Multi Ref ON expects reference node ID to point to Wan SQR Multi Reference; current={ref_class or 'Unknown'}, fallback to single image mode")
                         active_single_refs = seg_refs if director_plan else (seg_refs or ref_images_list)
                         img_idx = 0 if seg_refs else min(seg_num - 1, len(active_single_refs) - 1)
-                        img_entry = _sqr_make_ref_entry(_sqr_ref_entry_path(active_single_refs[img_idx]), False)
+                        img_entry = copy.deepcopy(active_single_refs[img_idx])
+                        if isinstance(img_entry, dict):
+                            img_entry["background"] = False
+                        else:
+                            img_entry = _sqr_make_ref_entry(_sqr_ref_entry_path(img_entry), False)
                         img_name = _sqr_ref_entry_to_input_name(img_entry)
                         if ref_class in ("WanSQRMultiReference", "SQRScail2ReferenceBatchStack"):
                             for ref_slot in range(1, 7):
@@ -2086,6 +2106,10 @@ class SegmentQueueRunner:
                             ref_inputs["image_1"] = _sqr_color_matched_ref(img_entry, load_id, 1)
                         else:
                             ref_inputs["image"] = img_name
+                            if color_guide_id and ref_class == "LoadImage":
+                                color_output = _sqr_color_matched_ref(active_single_refs[img_idx], ref_target_id, 1)
+                                _sqr_rewire_image_output(wf, [ref_target_id, 0], color_output)
+                                wf[color_output[0]]["inputs"]["image_target"] = [ref_target_id, 0]
                             wv = ref_node.get("widgets_values", [])
                             if wv:
                                 wv[0] = img_name
@@ -2098,7 +2122,7 @@ class SegmentQueueRunner:
                 total_raw = limit + startup_trim_frames + (transition_added_frames if use_transition else 0)
 
                 image_src = image_src_node
-                if use_transition and transition_enabled and transition_image_node is not None:
+                if use_transition and transition_enabled and transition_image_node is not None and not _wan_animate2:
                     prefix_start = 1 if _ae_class_type == "SQRSCAIL2TransitionToVideo" else 0
                     prefix_node = f"sqr_prefix_{seg_num}"
                     wf[prefix_node] = {
@@ -2113,7 +2137,15 @@ class SegmentQueueRunner:
                     }
                     image_src = [prefix_node, 0]
                     log(f"  Color continuity: restored {transition_added_frames} carry frames from source offset {prefix_start}, then released per-frame color correction over 20 frames")
-                if force_direct_segment_merge:
+                if _wan_animate2:
+                    trim_start = int(use_transition)
+                    trim_len = visible_limit
+                    final_image_node = f"sqr_ifb_{seg_num}_a"
+                    wf[final_image_node] = {"class_type": "ImageFromBatch", "inputs": {
+                        "image": image_src, "batch_index": trim_start, "length": trim_len,
+                    }}
+                    log(f"  Wan Animate 2: 移除{trim_start}帧续接锚点，保留{trim_len}帧")
+                elif force_direct_segment_merge:
                     trim_len = max(1, min(limit, max(0, total_frames - _actual_skip)))
                     trim_start = max(0, limit - trim_len)
                     ifb_a = f"sqr_ifb_{seg_num}_a"
@@ -2187,8 +2219,8 @@ class SegmentQueueRunner:
                     final_output_image_node = [final_image_node, 0]
                     if frame_interpolate_nid and frame_interpolate_nid in wf:
                         wf[frame_interpolate_nid]["inputs"]["images"] = final_output_image_node
-                        final_output_image_node = [frame_interpolate_nid, 0]
-                        log("  帧插值：先按源视频帧数裁切，再对完整分段插帧")
+                        final_output_image_node = video_output_image_node or [frame_interpolate_nid, 0]
+                        log("  帧插值：先按源视频帧数裁切，再保留原有后处理链进行插帧和输出")
 
                     # Keep the user's existing Video Combine node as the live
                     # per-segment preview target. The hidden full/cut clones are
@@ -2196,6 +2228,8 @@ class SegmentQueueRunner:
                     wf[vc_nid]["inputs"]["images"] = final_output_image_node
 
                     full_image_node = image_src
+                    if _wan_animate2:
+                        full_image_node = [final_image_node, 0]
                     if startup_trim_frames > 0:
                         full_align_id = f"sqr_ifb_{seg_num}_full_startup_aligned"
                         full_align_len = max(1, limit + (transition_added_frames if use_transition else 0))
@@ -2270,6 +2304,11 @@ class SegmentQueueRunner:
 
                 if unique_id:
                     positive_links = replace_director_positive_links(wf, unique_id, seg_positive)
+                    if _wan_animate2:
+                        pose_prompt = ""
+                        for config in segment_configs[:seg_num]:
+                            pose_prompt = str(config.get("positive_pose", "")).strip() or pose_prompt
+                        _sqr_rewire_image_output(wf, [str(unique_id), 2], pose_prompt or "A person moving naturally.")
                     if director_plan:
                         log(f"  Positive提示词: {seg_positive[:120]}{'...' if len(seg_positive) > 120 else ''} (rewired={positive_links})")
                     guide_node_id = f"sqr_director_guide_{seg_num}"
@@ -2284,25 +2323,6 @@ class SegmentQueueRunner:
                             "inputs": {"width": 1, "height": 1, "batch_size": 1, "color": 0},
                         }
                     guide_output = [guide_node_id, 0]
-                    color_ref_path = director_color_config.get("reference_path", "")
-                    if director_color_config.get("enabled") and color_ref_path:
-                        color_target_id = f"sqr_director_color_target_{seg_num}"
-                        color_match_id = f"sqr_director_color_match_{seg_num}"
-                        wf[color_target_id] = {
-                            "class_type": "LoadImage",
-                            "inputs": {"image": color_ref_path},
-                        }
-                        wf[color_match_id] = {
-                            "class_type": "ColorMatchV2",
-                            "inputs": {
-                                "image_target": [color_target_id, 0],
-                                "image_ref": [guide_node_id, 0],
-                                "method": "mkl",
-                                "strength": director_color_config.get("strength", 1.0),
-                                "multithread": True,
-                            },
-                        }
-                        guide_output = [color_match_id, 0]
                     guide_links = _sqr_rewire_image_output(
                         wf, [str(unique_id), 1], guide_output
                     )
@@ -2311,16 +2331,8 @@ class SegmentQueueRunner:
                             f"  比例引导帧: {'已载入 ' + director_guide_path if director_guide_path else '未提取，使用空白图像'} "
                             f"(rewired={guide_links})"
                         )
-                        if director_color_config.get("enabled") and color_ref_path:
-                            log(
-                                f"  Color Match: ON · method=mkl · "
-                                f"strength={director_color_config.get('strength', 1.0):.2f} · 使用第一张参考图"
-                            )
                     else:
                         del wf[guide_node_id]
-                        if director_color_config.get("enabled") and color_ref_path:
-                            wf.pop(f"sqr_director_color_target_{seg_num}", None)
-                            wf.pop(f"sqr_director_color_match_{seg_num}", None)
                     if unique_id in wf:
                         del wf[unique_id]
 
@@ -2334,6 +2346,11 @@ class SegmentQueueRunner:
                     pid = queue_prompt(wf, client_id=_client_id)
                     log(f"  prompt_id={pid[:8]}...")
                     ok  = wait_for_prompt(pid)
+                    if ok and vc_nid:
+                        output_path, _ = get_output_video_info(pid, vc_nid, logger=log)
+                        if not output_path or not os.path.isfile(output_path):
+                            log(f"✗ 第{seg_num}段未生成输出视频，停止后续分段。")
+                            ok = False
                     if ok:
                         log(f"✓ 第{seg_num}段完成")
                         if is_last_seg:
@@ -2558,7 +2575,7 @@ class SegmentQueueRunner:
                 else:
                     print("[SQR] 任务中断，checkpoint 保留供续跑检测")
 
-            log("═══ 全部完成 ═══")
+            log("═══ 全部完成 ═══" if _all_done else "═══ 未完成，请检查上方错误 ═══")
 
         if unique_id:
             _old_ckpt = read_checkpoint(unique_id)
@@ -2604,9 +2621,37 @@ class WanAniDirector(SegmentQueueRunner):
         return (resolved[0] if resolved else "", guide_frame)
 
 
+class WanAni2Director(WanAniDirector):
+    REQUIRE_POSITIVE_PROMPT = False
+    ANIMATE_NODE_TYPE = "WanAnimate2ToVideo"
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("positive", "比例引导帧", "positive_pose")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        data = copy.deepcopy(super().INPUT_TYPES())
+        for name in ("multi_ref_enabled", "replacement_enabled", "multi_ref_startup_fix"):
+            del data["required"][name]
+        data["required"]["director_data"][1]["tooltip"] = "WAN ANI 2 DIRECTOR: motion transfer, appearance/background and motion prompts."
+        return data
+
+    def run(self, *args, director_data="{}", **kwargs):
+        data = json.loads(director_data) if isinstance(director_data, str) else copy.deepcopy(director_data)
+        for segment in data.get("segments", []):
+            segment["mode"] = "transfer"
+            segment["multi_ref"] = False
+            segment.pop("sam3_marking", None)
+        for name in ("multi_ref_enabled", "replacement_enabled", "multi_ref_startup_fix"):
+            kwargs[name] = False
+        positive, guide = super().run(*args, director_data=json.dumps(data, ensure_ascii=False), **kwargs)
+        first = next((s for s in data.get("segments", []) if _sqr_to_bool(s.get("enabled", True), True)), {})
+        return positive, guide, str(first.get("positive_pose", "")).strip() or "A person moving naturally."
+
+
 NODE_CLASS_MAPPINGS = {
     "WanAniSQRSegmentQueue": SegmentQueueRunner,
     "WanAniDirector": WanAniDirector,
+    "WanAni2Director": WanAni2Director,
     "SQRReplaceBatchPrefix": SQRReplaceBatchPrefix,
     "SQRImageBatchConcat": SQRImageBatchConcat,
     "SQRRepeatFirstFrames": SQRRepeatFirstFrames,
@@ -2614,6 +2659,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanAniSQRSegmentQueue": "WanAni SQR",
     "WanAniDirector": "WAN ANI DIRECTOR",
+    "WanAni2Director": "WAN ANI 2 DIRECTOR",
     "SQRReplaceBatchPrefix": "SQR Replace Batch Prefix",
     "SQRRepeatFirstFrames": "SQR Repeat First Frames",
 }
@@ -2729,11 +2775,16 @@ async def sqr_get_director_checkpoint(request):
                 missing.append(f"segment {seg_index} SAM3 frame")
 
     outputs = []
-    for index, raw_path in enumerate(ckpt.get("segment_outputs", []) or [], start=1):
+    first_missing_segment = None
+    saved_outputs = ckpt.get("segment_outputs", []) or []
+    completed_segment = max(0, _sqr_to_int(ckpt.get("completed_seg"), 0))
+    for index in range(1, completed_segment + 1):
+        raw_path = saved_outputs[index - 1] if index <= len(saved_outputs) else ""
         resolved = _sqr_resolve_media_path(raw_path)
-        if resolved and os.path.isfile(resolved):
+        if resolved and os.path.isfile(resolved) and first_missing_segment is None:
             outputs.append(resolved)
         else:
+            first_missing_segment = first_missing_segment or index
             missing.append(f"completed segment output {index}")
 
     transition = _sqr_resolve_media_path(ckpt.get("transition_video", ""))
@@ -2748,6 +2799,7 @@ async def sqr_get_director_checkpoint(request):
     result = copy.deepcopy(ckpt)
     result["director_snapshot"] = snapshot
     result["segment_outputs"] = outputs
+    result["first_missing_segment"] = first_missing_segment
     result["transition_video"] = transition
     result["source_video"] = source_video if source_video and os.path.isfile(source_video) else ""
     result["missing"] = missing
@@ -3099,9 +3151,56 @@ _sqr_sam3_segment_instance = None
 _sqr_sam3_segment_lock = threading.Lock()
 
 
+def _sqr_native_sam3_mask(tensor, prompt_text, confidence, positive_points, negative_points):
+    import nodes
+    from comfy_extras.nodes_sam3 import SAM3_Detect
+
+    checkpoints = [
+        name for name in folder_paths.get_filename_list("checkpoints")
+        if "sam3" in os.path.basename(name).lower()
+    ]
+    if not checkpoints:
+        raise RuntimeError("No SAM3 checkpoint was found in models/checkpoints.")
+    preferred = next((name for name in checkpoints if "multiplex" in name.lower()), checkpoints[0])
+    model, clip, _ = nodes.CheckpointLoaderSimple().load_checkpoint(preferred)
+    height, width = tensor.shape[1:3]
+
+    def pixel_points(points):
+        result = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            result.append({
+                "x": int(round(max(0.0, min(1.0, float(point.get("x", 0.0)))) * max(0, width - 1))),
+                "y": int(round(max(0.0, min(1.0, float(point.get("y", 0.0)))) * max(0, height - 1))),
+            })
+        return result
+
+    positive = pixel_points(positive_points)
+    negative = pixel_points(negative_points)
+    conditioning = None
+    if not positive and not negative:
+        conditioning = nodes.CLIPTextEncode().encode(clip, prompt_text)[0]
+    with CurrentNodeContext("sqr-sam3-cutout", "sqr-sam3-cutout"):
+        output = SAM3_Detect.execute(
+            model=model,
+            image=tensor,
+            conditioning=conditioning,
+            positive_coords=json.dumps(positive) if positive else None,
+            negative_coords=json.dumps(negative) if negative else None,
+            threshold=confidence,
+            refine_iterations=2,
+            individual_masks=False,
+        )
+    masks = output.result[0]
+    if masks is None or masks.numel() == 0:
+        raise RuntimeError("SAM3 did not return a mask for this prompt.")
+    return masks.detach().float().clamp(0, 1).cpu()
+
+
 @server.PromptServer.instance.routes.post("/sqr/sam3_cutout")
 async def sqr_sam3_cutout(request):
-    """Create and cache an alpha cutout with the installed RMBG SAM3 node."""
+    """Create and cache an alpha cutout with an available SAM3 backend."""
     try:
         import nodes
         import numpy as np
@@ -3122,29 +3221,33 @@ async def sqr_sam3_cutout(request):
         negative_points = negative_points if isinstance(negative_points, list) else []
 
         node_class = nodes.NODE_CLASS_MAPPINGS.get("SAM3Segment")
-        if node_class is None:
-            raise RuntimeError("SAM3 Segmentation (RMBG) is not installed or failed to load.")
+        using_native_sam3 = node_class is None
         with Image.open(source_path) as opened:
             source = ImageOps.exif_transpose(opened).convert("RGB")
         tensor = torch.from_numpy(np.asarray(source, dtype=np.float32) / 255.0).unsqueeze(0)
 
-        global _sqr_sam3_segment_instance
-        with _sqr_sam3_segment_lock:
-            if _sqr_sam3_segment_instance is None:
-                _sqr_sam3_segment_instance = node_class()
-            _, masks, _ = _sqr_sam3_segment_instance.segment(
-                tensor, prompt_text, "Auto",
-                confidence_threshold=confidence,
-                max_segments=0,
-                segment_pick=0,
-                mask_blur=mask_blur,
-                mask_offset=mask_offset,
-                invert_output=False,
-                unload_model=False,
-                background="Alpha",
-                background_color="#000000",
-                output_mode="Separate" if positive_points else "Merged",
+        if node_class is None:
+            masks = _sqr_native_sam3_mask(
+                tensor, prompt_text, confidence, positive_points, negative_points
             )
+        else:
+            global _sqr_sam3_segment_instance
+            with _sqr_sam3_segment_lock:
+                if _sqr_sam3_segment_instance is None:
+                    _sqr_sam3_segment_instance = node_class()
+                _, masks, _ = _sqr_sam3_segment_instance.segment(
+                    tensor, prompt_text, "Auto",
+                    confidence_threshold=confidence,
+                    max_segments=0,
+                    segment_pick=0,
+                    mask_blur=mask_blur,
+                    mask_offset=mask_offset,
+                    invert_output=False,
+                    unload_model=False,
+                    background="Alpha",
+                    background_color="#000000",
+                    output_mode="Separate" if positive_points else "Merged",
+                )
         if masks is None or masks.numel() == 0:
             raise RuntimeError("SAM3 did not return a mask for this prompt.")
         masks = masks.detach().float().clamp(0, 1).cpu()
@@ -3177,6 +3280,14 @@ async def sqr_sam3_cutout(request):
         if float(mask.max()) <= 0.001:
             raise RuntimeError("SAM3 found no matching subject. Try a more specific prompt or lower confidence.")
         alpha = Image.fromarray((mask * 255.0).astype(np.uint8), "L")
+        if using_native_sam3 and mask_offset:
+            filter_size = abs(mask_offset) * 2 + 1
+            alpha = alpha.filter(
+                ImageFilter.MaxFilter(filter_size) if mask_offset > 0
+                else ImageFilter.MinFilter(filter_size)
+            )
+        if using_native_sam3 and mask_blur:
+            alpha = alpha.filter(ImageFilter.GaussianBlur(mask_blur))
         result = source.convert("RGBA")
         result.putalpha(alpha)
 

@@ -2,6 +2,25 @@
 
 # [English](README.md) 
 
+## 2026-09-15 更新 — Director 稳定性、原生 SAM3 与 WAN ANI 2
+
+### Summary
+提升 WAN ANI DIRECTOR 的执行、校验与续跑可靠性，兼容 ComfyUI 原生 SAM3 抠图，并新增面向 WAN ANI 2 与 MiniMax H3 的导演工具。
+
+### Description
+
+- 新增 `WAN ANI 2 DIRECTOR`，为 Wan Animate 2 工作流提供独立的分段导演台，支持逐段外观/背景提示词、动作提示词、源帧精确裁切、插帧后处理链路和过渡锚点。
+- 新增 MiniMax H3 Director/Compiler 节点及示例工作流，用于生成结构化、分段化的 H3 提示词。
+- 加强 WAN ANI DIRECTOR 执行前检查，可识别时间线空洞、重叠、越界、首段缺少参考图、必填提示词缺失和 Video Combine 节点配置错误。
+- Multi Ref、人物替换与 Colored Mask 的自动联动现在只作用于当前 Director 所连接的节点链，避免同一工作流中的多个导演台互相影响。
+- 当参考视频、帧率、跳帧、加载上限或抽帧设置变化时，自动清除已经失效的比例引导帧和 SAM3 打标数据。
+- 保留每张参考图各自的 Color Match 强度，并确保处理后的参考图真正进入单参考与多参考生成链。
+- 改进分段输出文件校验、插帧及后处理链路、从首个缺失分段开始的 checkpoint 恢复，以及任务中断状态提示。
+- 当旧版 RMBG `SAM3Segment` 不可用时，自动调用 ComfyUI 原生 `SAM3 Detect` 完成人物抠图，并保留正负打标点、置信度、遮罩扩张/收缩和羽化功能。
+- 新增 Director 计划、工作流作用域、插帧链路、续跑恢复、提示词继承和 WAN ANI 2 执行辅助逻辑的自动测试。
+
+更新后请重启 ComfyUI，并强制刷新浏览器页面。
+
 ## 2026-07-21 更新 — LH Image Editor 与跨环境队列回连
 
 ### Summary

@@ -1,0 +1,36 @@
+{
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LHMiniMaxH3DirectorTimeline",
+      "pos": [180, 120],
+      "size": [920, 980],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "compiled_prompt", "type": "STRING", "links": null, "slot_index": 0},
+        {"name": "timeline_json", "type": "STRING", "links": null, "slot_index": 1},
+        {"name": "reference_report", "type": "STRING", "links": null, "slot_index": 2},
+        {"name": "warning_report", "type": "STRING", "links": null, "slot_index": 3},
+        {"name": "length", "type": "INT", "links": null, "slot_index": 4},
+        {"name": "positive", "type": "CONDITIONING", "links": null, "slot_index": 5},
+        {"name": "latent", "type": "LATENT", "links": null, "slot_index": 6}
+      ],
+      "properties": {"Node name for S&R": "LHMiniMaxH3DirectorTimeline"},
+      "widgets_values": [
+        5.0,
+        "A cinematic cafe scene featuring @Character_A, with natural synchronized dialogue.",
+        "{\"version\":2,\"kind\":\"LH_MINIMAX_H3_DIRECTOR_TIMELINE\",\"duration\":5,\"settings\":{\"promptMode\":\"director\",\"snap\":0.1},\"global\":{\"format\":\"single continuous cinematic clip\",\"scene\":\"A quiet cinematic cafe interior\",\"visualStyle\":\"warm practical light, shallow depth of field, natural motion\",\"characterRules\":\"Keep @Character_A visually consistent.\",\"cameraRules\":\"Preserve screen direction and use intentional camera motion.\",\"audioRules\":\"Clean synchronized dialogue and subtle cafe ambience.\",\"continuity\":\"Maintain identity, wardrobe, props, lighting, and geography.\",\"visibleText\":\"\",\"avoid\":\"identity mixing, flicker, extra limbs, subtitles, logos, watermarks\"},\"references\":[{\"id\":\"ref_character\",\"name\":\"Character_A\",\"type\":\"image\",\"subject\":\"main character\",\"purpose\":\"identity\",\"mode\":\"preserve\",\"fidelity\":\"strict\",\"start\":0,\"end\":5,\"duration\":0,\"pairedVideoId\":\"\",\"notes\":\"Preserve face, hair, body proportions, and outfit.\",\"enabled\":true},{\"id\":\"ref_motion\",\"name\":\"Camera_Move\",\"type\":\"video\",\"subject\":\"camera\",\"purpose\":\"camera\",\"mode\":\"borrow\",\"fidelity\":\"balanced\",\"start\":0,\"end\":5,\"duration\":5,\"pairedVideoId\":\"\",\"notes\":\"Borrow camera rhythm, not identity or scene content.\",\"enabled\":true}],\"shots\":[{\"id\":\"shot_1\",\"title\":\"Arrival\",\"start\":0,\"end\":2.5,\"shotType\":\"medium shot\",\"lens\":\"50mm\",\"camera\":\"slow dolly in guided by @Camera_Move\",\"composition\":\"eye-level framing\",\"subjects\":\"@Character_A\",\"action\":\"@Character_A enters the cafe and looks toward camera\",\"expression\":\"quiet anticipation\",\"dialogue\":\"I finally found it.\",\"speaker\":\"@Character_A\",\"voice\":\"soft natural voice\",\"ambience\":\"quiet cafe room tone\",\"music\":\"\",\"sfx\":\"soft footsteps\",\"visibleText\":\"\",\"transition\":\"cut\",\"continuity\":\"Continue the walking action into the close-up.\",\"referenceIds\":[\"ref_character\",\"ref_motion\"]},{\"id\":\"shot_2\",\"title\":\"Recognition\",\"start\":2.5,\"end\":5,\"shotType\":\"close-up\",\"lens\":\"85mm\",\"camera\":\"locked camera\",\"composition\":\"face unobstructed\",\"subjects\":\"@Character_A\",\"action\":\"@Character_A smiles subtly\",\"expression\":\"relieved and confident\",\"dialogue\":\"Let's begin.\",\"speaker\":\"@Character_A\",\"voice\":\"same voice and cadence as the first shot\",\"ambience\":\"same cafe room tone\",\"music\":\"\",\"sfx\":\"\",\"visibleText\":\"\",\"transition\":\"cut\",\"continuity\":\"Match gaze, wardrobe, lighting, and position from Shot 1.\",\"referenceIds\":[\"ref_character\"]}]}"
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.9, "offset": [0, 0]}},
+  "version": 0.4
+}

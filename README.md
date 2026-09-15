@@ -4,6 +4,25 @@
 
 An automated long-video segment queue runner focused on ComfyUI core WanAnimate workflows, supporting segmented generation, transition injection, auto scene switching, breakpoint resuming, auto merging, and audio sync.
 
+## Update 2026-SEP-15 — Director Reliability, Native SAM3, and WAN ANI 2
+
+## Summary--
+Improve WAN ANI DIRECTOR execution safety and recovery, add native ComfyUI SAM3 cutout support, and introduce dedicated WAN ANI 2 and MiniMax H3 directing tools.
+
+## Description--
+
+- Added `WAN ANI 2 DIRECTOR`, a streamlined segmented console for Wan Animate 2 workflows with per-segment appearance/background prompts, motion prompts, precise source-frame trimming, interpolation-aware output routing, and transition-anchor handling.
+- Added the MiniMax H3 Director/compiler node and example workflow for compiling structured, segment-aware H3 prompts.
+- Tightened WAN ANI DIRECTOR preflight checks for timeline gaps, overlaps, overflow, missing first-segment references, missing prompts, and invalid Video Combine targets.
+- Limited automatic Multi Ref, replacement, and Colored Mask synchronization to the Director's own connected workflow chain so multiple Director workflows no longer affect each other.
+- Improved source-video change handling: stale guide frames and SAM3 marks are invalidated when the video or its frame-selection settings change.
+- Preserved per-reference Color Match strengths and ensured processed reference images enter both single-reference and multi-reference generation paths.
+- Improved segmented output verification, interpolation/post-processing routing, checkpoint recovery from the first missing output, and failure-state reporting.
+- Added native ComfyUI `SAM3 Detect` fallback for image cutouts when the legacy RMBG `SAM3Segment` node is unavailable, including positive/negative point tags, confidence, mask expansion/contraction, and feathering.
+- Added automated regression tests covering Director planning, workflow scoping, interpolation routing, recovery behavior, prompt inheritance, and WAN ANI 2 execution helpers.
+
+Restart ComfyUI and hard-refresh the browser after updating.
+
 ## Update 2026-JUL-28 — Native File Loading, Person Editing, and Director Timing
 
 ## Summary--
