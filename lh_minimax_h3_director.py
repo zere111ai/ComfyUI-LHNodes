@@ -544,6 +544,7 @@ def _normalize_shots(data: dict[str, Any], duration: float, refs: list[dict[str,
         "title", "shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace", "subjects", "action", "expression",
         "dialogue", "speaker", "voice", "language", "narration", "narrator", "narrationVoice", "narrationLanguage",
         "ambience", "music", "sfx", "transition", "continuity", "promptOverride",
+        "shotRelation", "focusMode", "focusTarget", "cameraSpeed", "cameraAmplitude", "cameraStability", "cameraTarget", "transitionOut",
     )
     for index, raw in enumerate(data.get("shots", []), 1):
         if not isinstance(raw, dict):
@@ -613,9 +614,6 @@ def _normalize_shots(data: dict[str, Any], duration: float, refs: list[dict[str,
             shot["cutoff"] = False
         shots.append(shot)
     shots.sort(key=lambda shot: (shot["start"], shot["end"]))
-    if shots:
-        shots[0]["directionMode"] = "master"
-        shots[0]["directionOverrides"] = {}
     if shots and shots[0]["start"] > 0.01:
         warnings.append(f"The shot plan starts at {shots[0]['start']:g}s, leaving an opening gap.")
     for previous, current in zip(shots, shots[1:]):
@@ -679,10 +677,10 @@ def _validate_limits(refs: list[dict[str, Any]], duration: float, frame_count: i
 
 def _replace_aliases(text: str, refs: list[dict[str, Any]], subject_labels: bool = False) -> str:
     for ref in sorted((item for item in refs if item.get("audioTag")), key=lambda item: len(item["name"]), reverse=True):
-        pattern = re.compile(r"@" + re.escape(ref["audioAlias"]) + r"(?![\w-])", re.IGNORECASE)
+        pattern = re.compile(r"(?<![A-Za-z0-9_])@" + re.escape(ref["audioAlias"]) + r"(?![A-Za-z0-9_-])", re.IGNORECASE)
         text = pattern.sub(ref["audioTag"], text)
     for ref in sorted(refs, key=lambda item: len(item["name"]), reverse=True):
-        pattern = re.compile(r"@" + re.escape(ref["name"]) + r"(?![\w-])", re.IGNORECASE)
+        pattern = re.compile(r"(?<![A-Za-z0-9_])@" + re.escape(ref["name"]) + r"(?![A-Za-z0-9_-])", re.IGNORECASE)
         replacement = ref.get("subjectTag", ref["tag"]) if subject_labels else ref["tag"]
         text = pattern.sub(replacement, text)
     return text
@@ -699,7 +697,7 @@ def _effective_prompt_sources(base_prompt: str, global_data: dict[str, str], sho
 def _shot_prompt_sources(shot: dict[str, Any]) -> list[str]:
     sources: list[str] = []
     visual_fields = ("title", "subjects", "action", "expression")
-    camera_fields = ("shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace")
+    camera_fields = ("shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace", "shotRelation", "focusMode", "focusTarget", "cameraSpeed", "cameraAmplitude", "cameraStability", "cameraTarget")
     if shot["promptOverrideEnabled"] and shot["promptOverride"]:
         return [shot["title"], shot["promptOverride"]]
     sources.extend(shot[field] for field in visual_fields)
@@ -715,6 +713,8 @@ def _shot_prompt_sources(shot: dict[str, Any]) -> list[str]:
         sources.append(shot["continuity"])
     if not shot["transitionAuto"] and shot["transition"]:
         sources.append(shot["transition"])
+    if not shot["transitionAuto"] and shot["transitionOut"]:
+        sources.append(shot["transitionOut"])
     if shot["directionMode"] == "custom":
         sources.extend(shot["directionOverrides"].values())
     return [str(source) for source in sources if source]
@@ -732,7 +732,7 @@ def _filter_prompt_references(refs: list[dict[str, Any]], sources: list[str]) ->
             aliases = [ref["name"]]
             if ref["type"] == "video" and ref["mediaMode"] == "video_audio":
                 aliases.append(f"{ref['name']}_Audio")
-            if not any(re.search(r"(?<![\w])@" + re.escape(alias) + r"(?![\w-])", text, re.IGNORECASE) for alias in aliases):
+            if not any(re.search(r"(?<![A-Za-z0-9_])@" + re.escape(alias) + r"(?![A-Za-z0-9_-])", text, re.IGNORECASE) for alias in aliases):
                 continue
             used_ids.add(ref["id"])
             pending_sources.extend(str(ref.get(field, "")) for field in ("subject", "description", "notes", "audioNotes", "speakerDescription") if ref.get(field))
@@ -808,13 +808,16 @@ def _shot_sentence(index: int, shot: dict[str, Any], refs: list[dict[str, Any]],
     visual = []
     if shot["cameraAuto"]:
         visual.append("The model designs the shot scale, lens, depth of field, camera movement, angle, composition, lighting, and motion pace to best serve the action")
-    for key in (() if shot["cameraAuto"] else ("shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace")):
+    for key in (() if shot["cameraAuto"] else ("shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace", "shotRelation", "focusMode", "focusTarget", "cameraSpeed", "cameraAmplitude", "cameraStability", "cameraTarget")):
         if shot[key]:
-            visual.append(_normalize_inline_speaker_ids(_replace_aliases(shot[key], refs, subject_labels=True), speaker_ids))
+            prefix = {"focusTarget": "Focus on ", "cameraTarget": "The camera follows "}.get(key, "")
+            visual.append(prefix + _normalize_inline_speaker_ids(_replace_aliases(shot[key], refs, subject_labels=True), speaker_ids))
     for key in ("subjects", "action", "expression"):
         if shot[key]:
             visual.append(_normalize_inline_speaker_ids(_replace_aliases(shot[key], refs, subject_labels=True), speaker_ids))
     parts = [label]
+    if not shot["transitionAuto"] and shot["transitionOut"]:
+        visual.append("At the end of this shot: " + _replace_aliases(shot["transitionOut"], refs, subject_labels=True))
     if visual:
         parts.append("; ".join(visual))
     if shot["directionMode"] == "custom":
@@ -843,7 +846,10 @@ def _shot_sentence(index: int, shot: dict[str, Any], refs: list[dict[str, Any]],
             if audio_tag and audio_tag not in labels:
                 labels.append(audio_tag)
         parts.append("Reference guidance active in this shot: " + ", ".join(labels))
-    inline_dialogue = re.search(r"<d>\s*\[[^\]]+\].*?</d>", shot["action"], re.IGNORECASE | re.DOTALL) is not None
+    inline_dialogue = bool(re.search(
+        r"<d>.*?</d>|[\"“‘「『]|\b(?:say|says|said|speak|speaks|speaking|whisper|whispers|shout|shouts|sing|sings|dialogue|voiceover|narration)\b|说|问|回答|喊|低语|对白|台词|旁白|唱",
+        shot["action"], re.IGNORECASE | re.DOTALL,
+    ))
     vocal_parts = []
     if shot["dialogue"]:
         dialogue_start, _, dialogue_range = _vocal_time_range(shot, "dialogue")
@@ -1113,6 +1119,16 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
     global_data = _normalize_global(data)
     all_refs = _normalize_references(data, duration, warnings)
     shots = _normalize_shots(data, duration, all_refs, warnings)
+    scoped_fields = {field for shot in shots if shot["directionMode"] == "custom"
+                     for field in shot["directionOverrides"]}
+    for shot in shots:
+        effective = {field: global_data[field] for field in scoped_fields}
+        if shot["directionMode"] == "custom":
+            effective.update(shot["directionOverrides"])
+        if effective:
+            shot["directionMode"] = "custom"
+            shot["directionOverrides"] = effective
+    global_data = {field: "" if field in scoped_fields else value for field, value in global_data.items()}
     shot_ids = {shot["id"] for shot in shots}
     for ref in all_refs:
         if ref.get("timelinePinned") and ref.get("timelineShotId") and ref["timelineShotId"] not in shot_ids:
@@ -1195,8 +1211,8 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
 
     opening_lines = []
     if global_data["format"] or global_data["visualStyle"]:
-        format_text = global_data["format"].rstrip(". ")
-        style_text = global_data["visualStyle"].rstrip(". ")
+        format_text = _replace_aliases(global_data["format"], refs, subject_labels=True).rstrip(". ")
+        style_text = _replace_aliases(global_data["visualStyle"], refs, subject_labels=True).rstrip(". ")
         opening_lines.append(f"The target video uses {format_text}" + (f" with {style_text}" if style_text else "") + ".")
     if global_data["scene"]:
         opening_lines.append(_replace_aliases(global_data["scene"], refs, subject_labels=True).rstrip(". ") + ".")
@@ -1208,7 +1224,7 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
                 label = "Avoid" if key == "avoid" else key.replace("Rules", " rules")
                 detailed_lines.append(f"{label}: {_replace_aliases(global_data[key], refs)}")
     soundscape = [_replace_aliases(global_data["audioRules"], refs).rstrip(". ") + "."] if global_data["audioRules"] else []
-    music = [] if not global_data["musicRules"] or global_data["musicRules"].upper() == "N/A" else [_replace_aliases(global_data["musicRules"], refs).rstrip(". ") + "."]
+    music = []
     shot_sound: list[str] = []
     shot_music: list[str] = []
     for index, shot in enumerate(shots, 1):
@@ -1228,8 +1244,10 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
             music_override = shot["directionOverrides"].get("musicRules", "")
             if audio_override:
                 shot_sound.append(f"Shot {index} director override: " + _replace_aliases(audio_override, refs))
-            if music_override and music_override.upper() != "N/A":
+            if music_override and music_override.upper() != "N/A" and (shot["audioAuto"] or shot["music"]):
                 shot_music.append(f"Shot {index} director override: " + _replace_aliases(music_override, refs))
+        if global_data["musicRules"] and global_data["musicRules"].upper() != "N/A" and (shot["audioAuto"] or shot["music"]):
+            shot_music.append(f"Shot {index} music direction: " + _replace_aliases(global_data["musicRules"], refs))
     if shot_sound:
         soundscape.append("Shot-specific sound: " + "; ".join(item.rstrip(". ") for item in shot_sound) + ".")
     if shot_music:
@@ -1259,6 +1277,9 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
         "non_diegetic_music:\n" + (" ".join(music) or "N/A"),
     ]
     compiled_prompt = "\n\n".join(prompt_parts)
+    remaining_aliases = sorted(set(re.findall(r"(?<![\w])@[\w.-]+", compiled_prompt)))
+    if remaining_aliases:
+        warnings.append("Unresolved aliases in compiled_prompt: " + ", ".join(remaining_aliases) + ".")
 
     report_lines = [
         "MiniMax H3 token presentation and connection order (prompt tags are 1-based; ComfyUI sockets are 0-based):"
@@ -1394,8 +1415,8 @@ def _load_embedded_audio(path: str, trim_start: float = 0.0, trim_end: float | N
             if frame_end <= trim_start or (trim_end is not None and timestamp >= trim_end):
                 continue
             array = frame.to_ndarray()
-            if array.ndim == 1:
-                array = array[None, :]
+            if not frame.format.is_planar:
+                array = array.reshape(-1, len(frame.layout.channels)).T
             local_start = max(0, int(round((trim_start - timestamp) * sample_rate)))
             local_end = array.shape[-1] if trim_end is None else min(array.shape[-1], int(round((trim_end - timestamp) * sample_rate)))
             if local_end > local_start:
@@ -1538,12 +1559,60 @@ class LHMiniMaxH3DirectorTimeline:
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
         native = MiniMaxH3ReferenceToVideo.execute(
-            clip, vae, audio_vae, compiled[0], width, height, compiled[4], ref_image_size,
-            ref_images, ref_videos, ref_video_audios, ref_audios,
+            clip=clip, vae=vae, audio_vae=audio_vae, prompt=compiled[0],
+            width=width, height=height, length=compiled[4], ref_image_size=ref_image_size,
+            ref_images=ref_images, ref_videos=ref_videos,
+            ref_video_audios=ref_video_audios, ref_audios=ref_audios,
         )
         positive, latent = native.result
         return (*compiled, positive, latent)
 
 
-NODE_CLASS_MAPPINGS = {"LHMiniMaxH3DirectorTimeline": LHMiniMaxH3DirectorTimeline}
-NODE_DISPLAY_NAME_MAPPINGS = {"LHMiniMaxH3DirectorTimeline": "MiniMax H3 Director Timeline v3"}
+class LHMiniMaxH3DirectorT8Conditioning:
+    CATEGORY = "LH/MiniMax H3"
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "av_latent")
+    FUNCTION = "encode"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "clip": ("CLIP",), "video_vae": ("VAE",), "audio_vae": ("VAE",),
+            "compiled_prompt": ("STRING", {"forceInput": True}),
+            "timeline_json": ("STRING", {"forceInput": True}),
+            "width": ("INT", {"default": 1280, "min": 32, "max": 16384, "step": 32}),
+            "height": ("INT", {"default": 736, "min": 32, "max": 16384, "step": 32}),
+            "ref_image_size": (["match", "max"],),
+        }, "optional": {"first_frame": ("IMAGE",), "last_frame": ("IMAGE",)}}
+
+    def encode(self, clip, video_vae, audio_vae, compiled_prompt, timeline_json,
+               width, height, ref_image_size="match", first_frame=None, last_frame=None):
+        import nodes
+
+        native = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3AudioConditioningT8")
+        if native is None:
+            raise RuntimeError("Install/enable comfyui-minimax-h3-audio-T8 and restart ComfyUI.")
+        timeline = json.loads(timeline_json)
+        ref_images, ref_videos, ref_video_audios, ref_audios = _load_director_media(timeline["references"])
+        result = native.execute(
+            clip=clip, video_vae=video_vae, audio_vae=audio_vae, prompt=compiled_prompt,
+            width=width, height=height, length=timeline["h3FrameCount"], task_type="auto",
+            audio_mode="native", audio_denoise_strength=1.0, add_source_as_reference=False,
+            prompt_primary_audio_ordinal=0, strict_prompt_tags=True,
+            ref_image_size=ref_image_size, reference_video_policy="official_2_to_15s",
+            allow_above_reference_area=False, first_frame=first_frame, last_frame=last_frame,
+            ref_images=ref_images, ref_videos=ref_videos,
+            ref_video_audios=ref_video_audios, ref_audios=ref_audios,
+        )
+        positive, latent, _, _, _, _ = result.result
+        return positive, latent
+
+
+NODE_CLASS_MAPPINGS = {
+    "LHMiniMaxH3DirectorTimeline": LHMiniMaxH3DirectorTimeline,
+    "LHMiniMaxH3DirectorT8Conditioning": LHMiniMaxH3DirectorT8Conditioning,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LHMiniMaxH3DirectorTimeline": "MiniMax H3 Director Timeline v3",
+    "LHMiniMaxH3DirectorT8Conditioning": "MiniMax H3 Director → T8 Conditioning",
+}

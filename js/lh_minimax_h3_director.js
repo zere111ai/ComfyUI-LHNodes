@@ -169,10 +169,15 @@ Object.assign(UI_ZH, {
 });
 
 const SHOT_PRESETS = {
+    shotRelation: [["single-subject framing", "单人／单主体"], ["two-shot", "双人"], ["group shot", "多人"], ["over-the-shoulder shot", "过肩"], ["point-of-view shot", "主观视角"], ["insert shot of a prop", "道具插入镜头"]],
+    focusMode: [["focus remains on the subject", "固定主体"], ["continuous focus tracking of the moving subject", "持续跟焦"], ["rack focus from foreground to subject", "前景向主体拉焦"], ["rack focus from subject to background", "主体向背景拉焦"]],
+    cameraSpeed: [["slow camera movement", "缓慢"], ["moderate camera movement speed", "正常"], ["fast camera movement", "快速"]],
+    cameraAmplitude: [["subtle camera movement", "轻微"], ["moderate camera movement amplitude", "中等"], ["large sweeping camera movement", "大幅"]],
+    cameraStability: [["smooth stabilized camera", "稳定器"], ["restrained handheld camera", "克制手持"], ["noticeably handheld camera", "明显手持"]],
     shotType: [
         ["extreme wide shot", "大远景"], ["wide shot", "远景"], ["full shot", "全景"], ["medium full shot", "中全景"],
         ["medium shot", "中景"], ["medium close-up", "中近景"], ["close-up", "近景"], ["extreme close-up", "特写"],
-        ["over-the-shoulder shot", "过肩镜头"], ["two-shot", "双人镜头"], ["point-of-view shot", "主观视角"], ["macro shot", "微距镜头"],
+        ["macro shot", "微距镜头"],
     ],
     camera: [
         ["locked-off tripod shot", "固定机位"], ["slow dolly in", "缓慢推进"], ["slow dolly out", "缓慢拉远"],
@@ -197,7 +202,6 @@ const SHOT_PRESETS = {
     depth: [
         ["deep depth of field, foreground and background in focus", "大景深，前后景清晰"], ["moderate depth of field", "中等景深"],
         ["shallow depth of field with soft background bokeh", "浅景深，背景柔和虚化"], ["extremely shallow depth of field", "极浅景深"],
-        ["rack focus from foreground to subject", "前景向主体拉焦"], ["rack focus from subject to background", "主体向背景拉焦"],
     ],
     transition: [
         ["cut", "直接切换"], ["hard cut", "硬切"], ["match cut", "匹配剪辑"], ["smash cut", "冲击式剪辑"],
@@ -238,6 +242,7 @@ const SHOT_PRESETS = {
 };
 
 const SHOT_TEMPLATE_FIELDS = [
+    "shotRelation", "focusMode", "focusTarget", "cameraSpeed", "cameraAmplitude", "cameraStability", "cameraTarget", "transitionOut",
     "cameraAuto", "shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace",
     "audioAuto", "ambience", "music", "sfx", "transitionAuto", "transition", "continuity",
 ];
@@ -474,7 +479,7 @@ function normalizeData(raw, duration) {
             language: shot.language === "Mandarin Chinese" ? "Chinese" : shot.language || "Chinese",
             narrationLanguage: shot.narrationLanguage === "Mandarin Chinese" ? "Chinese" : shot.narrationLanguage || "Chinese",
             referenceIds: Array.isArray(shot.referenceIds) ? shot.referenceIds : [],
-            directionMode: index === 0 ? "master" : shot.directionMode === "custom" ? "custom" : "inherit",
+            directionMode: shot.directionMode === "custom" ? "custom" : shot.directionMode === "master" ? "master" : "inherit",
             directionOverrides: shot.directionOverrides && typeof shot.directionOverrides === "object" ? shot.directionOverrides : {},
             promptOverrideEnabled: shot.promptOverrideEnabled === true || shot.prompt_override_enabled === true,
             promptOverride: shot.promptOverride || shot.prompt_override || "",
@@ -765,15 +770,25 @@ class DirectorUI {
     }
 
     effectivePromptSources() {
-        const sources = [this.basePromptWidget?.value || "", ...Object.values(this.data.global || {})];
+        const sources = [this.basePromptWidget?.value || "", ...Object.values(this.promptGlobal())];
         for (const shot of this.data.shots) sources.push(...this.shotPromptSources(shot));
         return sources.filter(Boolean).map(String);
+    }
+
+    promptGlobal() {
+        const values = { ...this.data.global };
+        for (const shot of this.data.shots) {
+            if (shot.directionMode === "custom") {
+                for (const field of Object.keys(shot.directionOverrides || {})) delete values[field];
+            }
+        }
+        return values;
     }
 
     shotPromptSources(shot) {
         const sources = [];
         const visualFields = ["title", "subjects", "action", "expression"];
-        const cameraFields = ["shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace"];
+        const cameraFields = ["shotType", "lens", "depth", "camera", "cameraAngle", "composition", "lighting", "motionPace", "shotRelation", "focusMode", "focusTarget", "cameraSpeed", "cameraAmplitude", "cameraStability", "cameraTarget"];
         if (shot.promptOverrideEnabled && shot.promptOverride) return [shot.title, shot.promptOverride].filter(Boolean).map(String);
         sources.push(...visualFields.map((field) => shot[field] || ""));
         if (!shot.cameraAuto) sources.push(...cameraFields.map((field) => shot[field] || ""));
@@ -782,7 +797,13 @@ class DirectorUI {
         if (!shot.audioAuto) sources.push(shot.ambience, shot.music, shot.sfx);
         if (shot.continuity) sources.push(shot.continuity);
         if (!shot.transitionAuto && shot.transition) sources.push(shot.transition);
-        if (shot.directionMode === "custom") sources.push(...Object.values(shot.directionOverrides || {}));
+        if (!shot.transitionAuto && shot.transitionOut) sources.push(shot.transitionOut);
+        const scoped = new Set(this.data.shots.filter((item) => item.directionMode === "custom")
+            .flatMap((item) => Object.keys(item.directionOverrides || {})));
+        for (const field of scoped) {
+            sources.push(shot.directionMode === "custom" && Object.hasOwn(shot.directionOverrides || {}, field)
+                ? shot.directionOverrides[field] : this.data.global[field]);
+        }
         return sources.filter(Boolean).map(String);
     }
 
@@ -812,7 +833,7 @@ class DirectorUI {
     }
 
     shotPromptReferences(shot) {
-        const globalRefs = this.referencesFromSources([this.basePromptWidget?.value || "", ...Object.values(this.data.global || {})]);
+        const globalRefs = this.referencesFromSources([this.basePromptWidget?.value || "", ...Object.values(this.promptGlobal())]);
         const shotRefs = this.referencesFromSources(this.shotPromptSources(shot));
         const ids = new Set([...globalRefs, ...shotRefs].map((ref) => ref.id));
         for (const id of shot.referenceIds || []) ids.add(id);
@@ -1506,14 +1527,15 @@ class DirectorUI {
     }
 
     presetInput(id, field, label, value, wide = false, placeholder = "") {
-        const presets = SHOT_PRESETS[field] || [];
+        value ||= "";
+        const presets = SHOT_PRESETS[field === "transitionOut" ? "transition" : field] || [];
         const presetOptions = presets.map(([preset, zh]) => `<option value="${esc(preset)}" ${preset === value ? "selected" : ""}>${esc(this.isChinese() ? `${zh} · ${preset}` : preset)}</option>`).join("");
-        const customLens = field === "lens" && Boolean(value) && !presets.some(([preset]) => preset === value);
-        const customOption = field === "lens" ? `<option value="__custom__" ${customLens ? "selected" : ""}>${this.isChinese() ? "自定义镜头…" : "Custom lens…"}</option>` : "";
+        const customLens = Boolean(value) && !presets.some(([preset]) => preset === value);
+        const customOption = `<option value="__custom__" ${customLens ? "selected" : ""}>${this.isChinese() ? "自定义／编辑…" : "Custom / edit…"}</option>`;
         return `<label class="h3d-preset-field ${wide ? "wide" : ""}">${label}<div class="h3d-preset-control">
-            <select data-shot-preset data-target="shot" data-id="${esc(id)}" data-field="${field}"><option value="">${this.isChinese() ? "选择预设…" : "Choose preset…"}</option>${presetOptions}${customOption}</select>
-            <input type="text" data-target="shot" data-id="${esc(id)}" data-field="${field}" value="${esc(value)}" placeholder="${esc(placeholder)}">
-        </div><small>${this.isChinese() ? "下方始终可以输入或修改自定义内容。" : "Custom value remains editable below."}</small></label>`;
+            <select data-shot-preset data-target="shot" data-id="${esc(id)}" data-field="${field}"><option value="" ${!value ? "selected" : ""}>${this.isChinese() ? "自动／不指定" : "Auto / unspecified"}</option>${presetOptions}${customOption}</select>
+            <input style="${customLens ? "" : "display:none"}" type="text" data-target="shot" data-id="${esc(id)}" data-field="${field}" value="${esc(value)}" placeholder="${esc(placeholder)}">
+        </div></label>`;
     }
 
     shotTemplates() {
@@ -1575,7 +1597,8 @@ class DirectorUI {
     }
 
     masterShot() {
-        return [...this.data.shots].sort((a, b) => Number(a.start) - Number(b.start) || Number(a.end) - Number(b.end))[0] || null;
+        return this.data.shots.find((shot) => shot.directionMode === "master")
+            || this.data.shots.find((shot) => shot.directionMode !== "custom") || null;
     }
 
     isMasterShot(shot) {
@@ -1851,7 +1874,7 @@ class DirectorUI {
         const input = (field, label, value) => `<label>${label}<input type="text" data-target="${target}" data-id="${esc(shot.id)}" data-field="${field}" value="${esc(value)}"${disabled}></label>`;
         const textarea = (field, label, value) => `<label class="wide">${label}<textarea data-target="${target}" data-id="${esc(shot.id)}" data-field="${field}"${disabled}>${esc(value)}</textarea></label>`;
         return `<details class="h3d-direction-editor" data-fold="${esc(shot.id)}:director"${this.sectionOpen(shot, "director")}>
-            <summary class="h3d-pane-title"><b>Director settings</b><small>${master ? "Shot 1 master settings" : custom ? "Custom override" : "Inherit Shot 1"}</small></summary>
+            <summary class="h3d-pane-title"><b>Director settings</b><small>${master ? (this.isChinese() ? "全局主设定（不随排序改变）" : "Global master settings (order-independent)") : custom ? "Custom override" : (this.isChinese() ? "继承全局设定" : "Inherit global settings")}</small></summary>
             <div class="h3d-template-bar h3d-direction-template-bar">
                 <input type="text" data-direction-template-name value="${esc(templateName)}" placeholder="${this.isChinese() ? "导演模板名称" : "Director template name"}">
                 <select data-direction-template-select><option value="">${this.isChinese() ? "选择导演模板" : "Select director template"}</option>${templateOptions}</select>
@@ -1877,6 +1900,15 @@ class DirectorUI {
     }
 
     shotSettingsPane(shot) {
+        const zh = this.isChinese();
+        const hints = [];
+        if (!shot.cameraAuto && /dolly zoom/i.test(shot.camera || "") && /\d+mm/i.test(shot.lens || "")) hints.push(zh ? "Dolly Zoom 与固定焦段可能冲突，建议焦段选自动。" : "Dolly Zoom may conflict with a fixed focal length; use Auto.");
+        if (!shot.cameraAuto && /locked-off/i.test(shot.camera || "") && (shot.cameraSpeed || shot.cameraAmplitude)) hints.push(zh ? "固定机位已搭配运动速度或幅度，请检查。" : "Locked camera has movement modifiers; check intent.");
+        if (!shot.cameraAuto && /slow/i.test(shot.camera || "") && /fast/i.test(shot.cameraSpeed || "")) hints.push(zh ? "运镜预设含“缓慢”，但速度选择了快速；请编辑运镜描述。" : "Slow movement preset conflicts with fast speed; edit the movement text.");
+        if (!shot.transitionAuto && /no cut/i.test(`${shot.transition || ""} ${shot.transitionOut || ""}`) && /cuts? to|切到|切换到/i.test(shot.action || "")) hints.push(zh ? "连续不切镜与动作提示词中的切镜描述可能冲突。" : "No-cut setting may conflict with cuts in the action text.");
+        const nextShot = [...this.data.shots].sort((a, b) => a.start - b.start).find((item) => item.start >= shot.end && item.id !== shot.id);
+        if (!shot.transitionAuto && shot.transitionOut && nextShot && !nextShot.transitionAuto && nextShot.transition && shot.transitionOut !== nextShot.transition) hints.push(zh ? "离开本镜头与下一镜头的进入转场不同，请确认衔接。" : "Outgoing transition differs from the next shot's incoming transition.");
+        const extraPreset = (field, cn, en) => this.presetInput(shot.id, field, zh ? cn : en, shot[field], true);
         const refChecks = this.promptReferences().map((ref) => `<label><input type="checkbox" data-shot-ref data-shot="${esc(shot.id)}" data-ref="${esc(ref.id)}" ${(shot.referenceIds || []).includes(ref.id) ? "checked" : ""}> @${esc(ref.name)}</label>`).join("");
         const templates = this.shotTemplates();
         const templateOptions = templates.length
@@ -1896,13 +1928,24 @@ class DirectorUI {
                 ${this.input("shot", shot.id, "start", "Start (s)", shot.start, false, "number")}
                 ${this.input("shot", shot.id, "end", "End (s)", shot.end, false, "number")}
             </div>
+            <div class="h3d-tip">${shot.promptOverrideEnabled ? (zh ? "完整提示词已接管：以下镜头、音效、转场不参与编译，原值保留。" : "Full prompt override active: controls below are preserved but not compiled.") : (zh ? "本镜头独立设置／模板载入值。单项自动不写入限制；导演设定的继承在右侧管理。" : "Shot-local / template values. Auto adds no constraint; global direction inheritance is managed on the right.")}</div>
+            ${!shot.promptOverrideEnabled && hints.length ? `<div class="h3d-tip">${hints.map(esc).join("<br>")}</div>` : ""}
+            <fieldset style="border:0;padding:0;margin:0;min-width:0;${shot.promptOverrideEnabled ? "opacity:.5" : ""}" ${shot.promptOverrideEnabled ? "disabled" : ""}>
             <section class="h3d-setting-module">
                 <div class="h3d-setting-module-head"><b>Camera settings</b><label><input type="checkbox" data-target="shot" data-id="${esc(shot.id)}" data-field="cameraAuto" ${shot.cameraAuto ? "checked" : ""}> Auto design</label></div>
                 ${shot.cameraAuto ? `<div class="h3d-module-auto-note">Let the model design this entire section.</div>` : `<div class="h3d-grid h3d-left-settings">
                     ${this.presetInput(shot.id, "shotType", "Shot type", shot.shotType, true, "close-up / wide / macro")}
+                    ${extraPreset("shotRelation", "镜头关系", "Framing relationship")}
                     ${this.presetInput(shot.id, "lens", "Lens", shot.lens, true, "50mm standard lens")}
                     ${this.presetInput(shot.id, "depth", "Depth of field", shot.depth, true, "shallow depth of field")}
+                    ${extraPreset("focusMode", "对焦方式", "Focus mode")}
+                    ${this.input("shot", shot.id, "focusTarget", zh ? "对焦对象（可 @素材）" : "Focus target (@reference)", shot.focusTarget || "", true)}
                     ${this.presetInput(shot.id, "camera", "Camera movement", shot.camera, true, "slow dolly, pan right, handheld follow")}
+                    <details class="wide"><summary>${zh ? "运镜细项（可选）" : "Movement details (optional)"}</summary>
+                    ${extraPreset("cameraSpeed", "运镜速度", "Camera speed")}
+                    ${extraPreset("cameraAmplitude", "运镜幅度", "Camera amplitude")}
+                    ${extraPreset("cameraStability", "稳定性", "Camera stability")}
+                    ${this.input("shot", shot.id, "cameraTarget", zh ? "跟随目标（可 @素材）" : "Tracking target (@reference)", shot.cameraTarget || "", true)}</details>
                     ${this.presetInput(shot.id, "cameraAngle", "Camera angle", shot.cameraAngle, true, "eye-level camera angle")}
                     ${this.presetInput(shot.id, "composition", "Composition / screen direction", shot.composition, true, "rule-of-thirds composition")}
                     ${this.presetInput(shot.id, "lighting", "Shot lighting", shot.lighting, true, "soft natural daylight")}
@@ -1921,10 +1964,12 @@ class DirectorUI {
             <section class="h3d-setting-module h3d-transition-module">
                 <div class="h3d-setting-module-head"><b>Transition settings</b><label><input type="checkbox" data-target="shot" data-id="${esc(shot.id)}" data-field="transitionAuto" ${shot.transitionAuto ? "checked" : ""}> Auto design</label></div>
                 ${shot.transitionAuto ? `<div class="h3d-module-auto-note">Let the model design this entire section.</div>` : `<div class="h3d-grid h3d-left-settings">
-                    ${this.presetInput(shot.id, "transition", "Transition", shot.transition, true, "cut / match cut / continuous shot")}
+                    ${this.presetInput(shot.id, "transition", zh ? "进入本镜头（首镜头不应用）" : "Transition in (not applied to first shot)", shot.transition, true, "cut / match cut / continuous shot")}
+                    ${extraPreset("transitionOut", "离开本镜头", "Transition out")}
                     ${this.input("shot", shot.id, "continuity", "Continuity handoff", shot.continuity, true)}
                 </div>`}
             </section>
+            </fieldset>
             <fieldset class="h3d-shot-references"><legend>Shot references</legend><div class="h3d-checks">${refChecks || "No enabled references"}</div><small>Only materials mentioned by an effective @alias are sent to H3. Manually placed timeline blocks are planning aids only.</small></fieldset>
         </section>`;
     }
@@ -2015,14 +2060,14 @@ class DirectorUI {
             if (eventName === "input") element.addEventListener("change", () => this.render());
         });
         this.host.querySelectorAll("[data-shot-preset]").forEach((select) => select.addEventListener("change", () => {
-            if (!select.value) return;
             const input = select.parentElement.querySelector(`input[data-field="${select.dataset.field}"]`);
             const custom = select.value === "__custom__";
-            if (input) input.value = custom ? "" : select.value;
+            if (input) { if (!custom) input.value = select.value; input.style.display = custom ? "" : "none"; }
             const shot = this.find("shot", select.dataset.id);
-            if (shot) shot[select.dataset.field] = custom ? "" : select.value;
+            if (shot && !custom) shot[select.dataset.field] = select.value;
             this.write();
             if (custom) input?.focus();
+            else this.render();
         }));
         this.host.querySelectorAll("[data-language-select]").forEach((select) => select.addEventListener("change", () => {
             const shot = this.find("shot", select.dataset.id);

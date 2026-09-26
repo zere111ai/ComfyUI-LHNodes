@@ -210,7 +210,7 @@ class Animate2QueueTests(unittest.TestCase):
 
     def test_workflow_has_consistent_links_and_native_conditioning(self):
         root = SOURCE.parents[2]
-        workflow = json.loads((root / 'user/default/workflows/WAN-ANI2-导演台-多参动作迁移-分段队列 V1.json').read_text(encoding='utf-8'))
+        workflow = json.loads((root / 'user/default/workflows/wan/WAN-ANI2-导演台-多参动作迁移-分段队列 V1.json').read_text(encoding='utf-8'))
         nodes = {node['id']: node for node in workflow['nodes']}
         links = {link[0]: link for link in workflow['links']}
         self.assertEqual(len(nodes), len(workflow['nodes']))
