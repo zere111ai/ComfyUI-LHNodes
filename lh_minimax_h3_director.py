@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import wave
@@ -240,6 +241,7 @@ def _parse_data(raw: Any, duration: float) -> tuple[dict[str, Any], list[str]]:
 def _normalize_settings(data: dict[str, Any]) -> dict[str, Any]:
     settings = data.get("settings", {})
     return {
+        "uiMode": _choice(settings.get("uiMode"), {"director", "simple", "edit"}, "director"),
         "promptMode": "compact" if settings.get("promptMode") == "compact" else "director",
         "snap": max(1 / FPS, min(1.0, _float(settings.get("snap"), 0.1))),
     }
@@ -1110,12 +1112,78 @@ def _retention_analysis(refs: list[dict[str, Any]], shots: list[dict[str, Any]])
     return "\n".join(lines)
 
 
+def _prepare_video_edit(data: dict[str, Any], duration: float, warnings: list[str]):
+    edit = data.get("edit", {})
+    refs = [dict(ref) for ref in data["references"] if isinstance(ref, dict)]
+    source = next((ref for ref in refs if ref.get("id") == edit.get("sourceRefId")
+                   and ref.get("type") == "video" and ref.get("enabled", True)), None)
+    if source is None:
+        raise ValueError("Video edit mode needs an enabled source video selected in the editor.")
+    start = max(0.0, _float(source.get("trimStart")))
+    end = _float(source.get("trimEnd"), _float(source.get("sourceDuration")))
+    if edit.get("followSource", True):
+        if end <= start:
+            raise ValueError("Upload a source video with a valid crop duration, or select manual output duration.")
+        duration = end - start
+    source.update(purpose="edit_source", frameRole="edit_source")
+    if source.get("mediaMode") == "audio":
+        source["mediaMode"] = "video"
+    source_alias = "@" + str(source.get("name", "Source"))
+    lines = [f"Edit {source_alias}. Keep all undesignated people and objects unchanged."]
+    for field, label in (("preserveMotion", "subject actions, timing, contact and interactions"),
+                         ("preserveCamera", "shot order, cuts, framing and camera movement"),
+                         ("preserveScene", "background, lighting and scene layout")):
+        if edit.get(field, True):
+            lines.append(f"Preserve {source_alias}'s {label}.")
+    replacements = []
+    for row in edit.get("replacements", []):
+        if not isinstance(row, dict):
+            continue
+        ref = next((ref for ref in refs if ref.get("id") == row.get("refId")
+                    and ref.get("type") == "image" and ref.get("enabled", True)), None)
+        target = _clean_multiline(row.get("target"))
+        if ref is None or not target:
+            warnings.append("An incomplete replacement row was ignored; select an image and describe the source person.")
+            continue
+        scope = _clean_multiline(row.get("scope")) or "face, hair, body proportions, clothing and accessories"
+        lines.append(f"In {source_alias}, replace the person identified as [{target}] with @{ref['name']}. "
+                     f"Transfer only these attributes: {scope}. Keep this mapping consistent across cuts, movement and occlusion.")
+        if row.get("characterSheet", False):
+            lines.append(f"@{ref['name']} is a multi-view character sheet of one person. Use its views for identity and clothing only; "
+                         "do not render the sheet layout, duplicate people, labels or its background.")
+        replacements.append({"refId": ref["id"], "target": target, "scope": scope,
+                             "characterSheet": row.get("characterSheet", False) is True})
+    sound = {}
+    for field, label in (("dialogue", "dialogue and vocal delivery"), ("ambience", "environmental ambience"),
+                         ("sfx", "physical sound effects"), ("music", "music")):
+        mode = "manual" if edit.get(field + "Mode") == "manual" else "source"
+        text = _clean_multiline(edit.get(field))
+        sound[field] = text if mode == "manual" else f"Preserve {source_alias}'s {label}, including its timing."
+        if mode == "manual" and not text:
+            sound[field] = f"No {label}."
+    if any(edit.get(field + "Mode") != "manual" for field in ("dialogue", "ambience", "sfx", "music")):
+        warnings.append("Source sound preservation is a generation instruction; this node does not copy the original audio into the exported video.")
+        if source.get("mediaMode", "video") != "video_audio":
+            warnings.append("Enable picture + soundtrack on the source video to provide its audio as a model reference.")
+    lines.append(_clean_multiline(edit.get("notes")))
+    global_data = {key: "" for key in _default_global()}
+    global_data.update(format="source-video edit", audioRules=" ".join(sound[field] for field in ("dialogue", "ambience", "sfx")),
+                       musicRules=sound["music"])
+    target_frames = max(1, round(duration * FPS))
+    plan = {**edit, "sourceRefId": source["id"], "replacements": replacements,
+            "targetFrameCount": target_frames, "sourceStart": start, "sourceEnd": end}
+    return {**data, "references": refs, "shots": [], "global": global_data}, duration, "\n".join(filter(None, lines)), plan
+
+
 def compile_director(base_prompt: str, duration: float, director_data: Any) -> tuple[str, str, str, str, int]:
     warnings: list[str] = []
     duration = max(0.01, _float(duration, 5.0))
     data, parse_warnings = _parse_data(director_data, duration)
     warnings.extend(parse_warnings)
     settings = _normalize_settings(data)
+    edit_plan = None
+    if settings["uiMode"] == "edit":
+        data, duration, base_prompt, edit_plan = _prepare_video_edit(data, duration, warnings)
     global_data = _normalize_global(data)
     all_refs = _normalize_references(data, duration, warnings)
     shots = _normalize_shots(data, duration, all_refs, warnings)
@@ -1150,6 +1218,10 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
             or ref["id"] in shot_ref_ids
         ]
     frame_count = _h3_frame_count(duration)
+    if edit_plan is not None:
+        frame_count = 5 + 17 * max(0, math.ceil((edit_plan["targetFrameCount"] - 5) / 17))
+        edit_plan["paddingFrames"] = frame_count - edit_plan["targetFrameCount"]
+        warnings.append(f"Edit output: generate {frame_count} frames, then trim to {edit_plan['targetFrameCount']} frames at 24 fps in the output pipeline.")
     _assign_tags(refs, warnings)
     _assign_subject_tags(refs)
     _validate_limits(refs, duration, frame_count, warnings)
@@ -1175,6 +1247,8 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
         "shots": shots,
     }
     compact = settings["promptMode"] == "compact"
+    if edit_plan is not None:
+        normalized["edit"] = edit_plan
     speaker_ids = _speaker_ids(shots, refs, warnings)
     for ref in refs:
         if not (ref.get("audioTag") or ref.get("tag", "").startswith("<Audio")):
@@ -1225,6 +1299,8 @@ def compile_director(base_prompt: str, duration: float, director_data: Any) -> t
                 detailed_lines.append(f"{label}: {_replace_aliases(global_data[key], refs)}")
     soundscape = [_replace_aliases(global_data["audioRules"], refs).rstrip(". ") + "."] if global_data["audioRules"] else []
     music = []
+    if edit_plan is not None:
+        music.append(_replace_aliases(global_data["musicRules"], refs))
     shot_sound: list[str] = []
     shot_music: list[str] = []
     for index, shot in enumerate(shots, 1):
@@ -1554,8 +1630,19 @@ class LHMiniMaxH3DirectorTimeline:
             return (*compiled, None, None)
         if not all(supplied):
             raise ValueError("Connect clip, vae, and audio_vae together to enable direct H3 conditioning.")
-        refs = json.loads(compiled[1])["references"]
+        timeline = json.loads(compiled[1])
+        refs = timeline["references"]
         ref_images, ref_videos, ref_video_audios, ref_audios = _load_director_media(refs)
+        if "edit" in timeline:
+            source = next(ref for ref in refs if ref["id"] == timeline["edit"]["sourceRefId"])
+            connection = source["connection"]
+            frames = ref_videos[connection][:compiled[4]]
+            padding = (5 - frames.shape[0]) % 17
+            if frames.shape[0] < 5:
+                padding = 5 - frames.shape[0]
+            if padding:
+                frames = torch.cat((frames, frames[-1:].expand(padding, -1, -1, -1)))
+            ref_videos[connection] = frames
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
         native = MiniMaxH3ReferenceToVideo.execute(

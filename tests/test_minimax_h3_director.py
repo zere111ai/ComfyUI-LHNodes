@@ -40,6 +40,75 @@ def shot(index, start, end, action, **values):
 
 
 class DirectorCompilerTests(unittest.TestCase):
+    def edit_plan(self, **edit):
+        source = image_ref(1, "Source", type="video", sourcePath="source.mp4", sourceDuration=12,
+                           trimStart=2, trimEnd=9, mediaMode="video_audio")
+        return {
+            "settings": {"uiMode": "edit"},
+            "references": [source, image_ref(2, "Alice"), image_ref(3, "Bob")],
+            "global": {"scene": "OLD SCENE", "audioRules": "OLD AUDIO"},
+            "shots": [shot(1, 0, 5, "OLD ACTION", camera="OLD CAMERA")],
+            "edit": {"sourceRefId": "ref_1", "replacements": [
+                {"refId": "ref_2", "target": "woman in black on the right", "scope": "hair and clothing", "characterSheet": True},
+                {"refId": "ref_3", "target": "man in blue on the left", "scope": "face"},
+            ], **edit},
+        }
+
+    def test_edit_mappings_replace_hidden_shot_controls(self):
+        result = director.compile_director("OLD BASE", 5, self.edit_plan())
+        for text in ("woman in black on the right", "man in blue on the left", "hair and clothing", "multi-view character sheet"):
+            self.assertIn(text, result[0])
+        for text in ("OLD BASE", "OLD ACTION", "OLD CAMERA", "OLD SCENE", "OLD AUDIO", "@Alice", "@Source"):
+            self.assertNotIn(text, result[0])
+        timeline = json.loads(result[1])
+        self.assertEqual(timeline["duration"], 7)
+        self.assertEqual(timeline["shots"], [])
+        self.assertEqual(len(timeline["edit"]["replacements"]), 2)
+        self.assertEqual(timeline["edit"]["targetFrameCount"], 168)
+        self.assertEqual(result[4], 175)
+        self.assertEqual(timeline["edit"]["paddingFrames"], 7)
+        self.assertIn("does not copy the original audio", result[3])
+
+    def test_edit_manual_sound_and_manual_duration(self):
+        result = director.compile_director("", 5, self.edit_plan(
+            followSource=False, dialogueMode="manual", dialogue="Say hello.",
+            ambienceMode="manual", ambience="Wind in trees.", sfxMode="manual", sfx="",
+            musicMode="manual", music="Quiet piano."))
+        self.assertEqual(json.loads(result[1])["duration"], 5)
+        self.assertIn("Wind in trees.", result[0])
+        self.assertIn("No physical sound effects.", result[0])
+        self.assertIn("non_diegetic_music:\nQuiet piano.", result[0])
+        self.assertNotIn("does not copy the original audio", result[3])
+
+    def test_edit_requires_selected_source_and_known_source_duration(self):
+        with self.assertRaisesRegex(ValueError, "source video"):
+            director.compile_director("", 5, self.edit_plan(sourceRefId="missing"))
+        data = self.edit_plan()
+        data["references"][0].update(sourceDuration=0, trimEnd=None)
+        with self.assertRaisesRegex(ValueError, "crop duration"):
+            director.compile_director("", 5, data)
+
+    def test_edit_incomplete_mapping_does_not_load_unused_image(self):
+        data = self.edit_plan()
+        data["edit"]["replacements"][1]["target"] = ""
+        result = director.compile_director("", 5, data)
+        self.assertEqual([ref["name"] for ref in json.loads(result[1])["references"]], ["Source", "Alice"])
+        self.assertIn("incomplete replacement", result[3])
+
+    def test_edit_reference_pads_tail_before_native_h3_truncation(self):
+        native = ModuleType("comfy_extras.nodes_minimax_h3")
+        execute = Mock(return_value=SimpleNamespace(result=("positive", "latent")))
+        native.MiniMaxH3ReferenceToVideo = SimpleNamespace(execute=execute)
+        frames = director.torch.arange(168.0).reshape(168, 1, 1, 1)
+        media = ({}, {"ref_video_0": frames}, {}, {})
+        with patch.dict(sys.modules, {native.__name__: native}), patch.object(director, "_load_director_media", return_value=media):
+            result = director.LHMiniMaxH3DirectorTimeline().compile(
+                5, "", self.edit_plan(), clip=object(), vae=object(), audio_vae=object())
+        padded = execute.call_args.kwargs["ref_videos"]["ref_video_0"]
+        self.assertEqual(padded.shape[0], result[4])
+        self.assertTrue(director.torch.equal(padded[:168], frames))
+        self.assertTrue((padded[168:] == 167).all())
+
     def test_camera_details_compile_and_select_references(self):
         result = self.compile(5, [image_ref(1, "A"), image_ref(2, "Unused")], [
             shot(1, 0, 5, "Waits.", focusTarget="@A", cameraTarget="@A",

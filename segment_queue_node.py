@@ -1228,7 +1228,7 @@ class SQRRepeatFirstFrames:
 
 def merge_videos(video_paths: list, output_path: str, target_fps: float = None,
                  source_audio_path: str = None, total_frames: int = None,
-                 source_fps: float = None) -> bool:
+                 source_fps: float = None, source_audio_start_time: float = 0.0) -> bool:
     import subprocess, tempfile
     if not video_paths:
         return False
@@ -1272,7 +1272,8 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None,
 
         duration = total_frames / source_fps
         remux_cmd = [
-            "ffmpeg", "-y", "-i", concat_output, "-i", source_audio_path,
+            "ffmpeg", "-y", "-i", concat_output,
+            "-ss", f"{max(0.0, source_audio_start_time):.9f}", "-i", source_audio_path,
             "-map", "0:v:0", "-map", "1:a:0?",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-t", f"{duration:.9f}", "-movflags", "+faststart", output_path,
@@ -1785,6 +1786,7 @@ class SegmentQueueRunner:
                         startup_trim_frames = MULTI_REF_STARTUP_TRIM_FRAMES
                         log(f"  Multi Ref startup fix: repeat_prefix={startup_trim_frames} trim_after_prefix={startup_trim_frames} reason={startup_trim_reason}")
                 _wan_animate2 = _ae_class_type == "WanAnimate2ToVideo"
+                source_stride = max(1, int(wf[node_id]["inputs"].get("select_every_nth", 1)))
                 _transition_frames_for_load = 1 if _wan_animate2 and use_transition else 0
                 _video_skip = max(0, _actual_skip - _transition_frames_for_load)
                 _video_limit = limit + (_actual_skip - _video_skip)
@@ -1795,11 +1797,9 @@ class SegmentQueueRunner:
                 if transition_enabled and not transition_supported and seg_num == start_idx + 1:
                     log(f"  ⚠ 当前节点[{_ae_class_type}]不支持 transition_video，过渡效果回退为直出合并")
 
-                wf[node_id]["inputs"]["skip_first_frames"] = main_ref_skip_first + _video_skip
+                wf[node_id]["inputs"]["skip_first_frames"] = main_ref_skip_first + _video_skip * source_stride
                 wf[node_id]["inputs"]["frame_load_cap"]    = _video_limit
                 if _wan_animate2:
-                    source_stride = max(1, int(wf[node_id]["inputs"].get("select_every_nth", 1)))
-                    wf[node_id]["inputs"]["skip_first_frames"] = main_ref_skip_first + _video_skip * source_stride
                     animate_inputs = wf[ae_nid]["inputs"]
                     # Include the anchor, round up to 4n+1, then crop to the edit range.
                     animate_inputs["length"] = ((visible_limit + int(use_transition) + 2) // 4) * 4 + 1
@@ -1886,9 +1886,7 @@ class SegmentQueueRunner:
                         log("  ⚠ SAM3 手动打标已保存，但未找到驱动视频 SAM3_VideoTrack 或其模型连接")
 
                 if vc_nid and vc_nid in wf and audio_filename:
-                    _real_skip = main_ref_skip_first + skip + _frame_offset
-                    if _wan_animate2:
-                        _real_skip = main_ref_skip_first / source_stride + skip + _frame_offset
+                    _real_skip = main_ref_skip_first / source_stride + skip + _frame_offset
                     if use_transition and transition_enabled:
                         audio_skip_frames    = _real_skip
                         main_audio_frames    = max(0, _real_skip - transition_added_frames)
@@ -2489,14 +2487,16 @@ class SegmentQueueRunner:
                 merged_fname = os.path.basename(merged_path)
                 source_audio_path = _sqr_resolve_media_path(audio_filename)
                 if source_audio_path:
-                    log(f"Final audio: full source track {os.path.basename(source_audio_path)}, target={total_frames} frames")
+                    source_audio_start_time = (main_ref_skip_first / source_stride + _frame_offset) / frame_rate
+                    log(f"Final audio: source={os.path.basename(source_audio_path)}, start={source_audio_start_time:.3f}s, target={total_frames} frames")
                 else:
                     log("Final audio: source media not found; keeping segmented audio")
                 if merge_videos(segment_output_paths, merged_path,
                                target_fps=frame_rate if pre_segment_paths else None,
                                source_audio_path=source_audio_path,
                                total_frames=total_frames,
-                               source_fps=frame_rate):
+                               source_fps=frame_rate,
+                               source_audio_start_time=(main_ref_skip_first / source_stride + _frame_offset) / frame_rate):
                     log(f"✓ 合并完成: {_sub + merged_fname}")
                 else:
                     log(f"✗ 合并失败，请手动拼接各段视频")

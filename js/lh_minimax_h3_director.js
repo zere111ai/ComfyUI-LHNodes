@@ -418,12 +418,20 @@ function emptyPlan(duration) {
     return { version: VERSION, kind: KIND, duration, settings: { promptMode: "director", snap: 0.1, uiLanguage: "zh", uiFontSize: 12, uiMode: "director" }, global: defaultGlobal(), references: [], shots: [] };
 }
 
+function defaultEdit() {
+    return { sourceRefId: "", followSource: true, preserveMotion: true, preserveCamera: true, preserveScene: true,
+        replacements: [], dialogueMode: "source", ambienceMode: "source", sfxMode: "source", musicMode: "source",
+        dialogue: "", ambience: "", sfx: "", music: "", notes: "" };
+}
+
 function normalizeData(raw, duration) {
     const plan = emptyPlan(duration);
     if (!raw || typeof raw !== "object") return plan;
     plan.settings = { ...plan.settings, ...(raw.settings || {}) };
     plan.settings.uiFontSize = clamp(Number(plan.settings.uiFontSize || 12), 10, 18);
-    plan.settings.uiMode = plan.settings.uiMode === "simple" ? "simple" : "director";
+    plan.settings.uiMode = ["simple", "edit"].includes(plan.settings.uiMode) ? plan.settings.uiMode : "director";
+    plan.edit = { ...defaultEdit(), ...(raw.edit || {}) };
+    plan.edit.replacements = Array.isArray(plan.edit.replacements) ? plan.edit.replacements.filter((row) => row && typeof row === "object").map((row) => ({ ...row, id: row.id || makeId("replacement") })) : [];
     delete plan.settings.speechGapFill;
     delete plan.settings.speech_gap_fill;
     plan.global = { ...plan.global, ...(raw.global || {}) };
@@ -607,12 +615,16 @@ function presetPlan(name, duration) {
         Object.assign(b, { title: "Payoff", subjects: "@Product", action: "@Product settles into a clean final hero composition", camera: "gentle pull back", transition: "seamless motivated cut" });
         plan.shots = [a, b];
     } else if (name === "remix") {
+        plan.settings.uiMode = "edit";
         plan.global.format = "reference-video edit and regeneration";
         const source = defaultReference(duration, "video", 1);
         Object.assign(source, { name: "Source", purpose: "edit_source", mode: "transform", fidelity: "strong", notes: "Preserve requested timing, action, camera, and composition; regenerate only the changes described in the shot plan." });
         const identity = defaultReference(duration, "image", 2);
         Object.assign(identity, { name: "Replacement", purpose: "identity", mode: "replace", fidelity: "strict", notes: "Replace the designated subject while preserving @Source's action and scene interaction." });
         plan.references = [source, identity];
+        source.frameRole = "edit_source";
+        plan.edit = { ...defaultEdit(), sourceRefId: source.id,
+            replacements: [{ id: makeId("replacement"), refId: identity.id, target: "", scope: "face, hair, body proportions, clothing and accessories", characterSheet: false }] };
         const shot = defaultShot(duration, 0, 1);
         Object.assign(shot, { title: "Controlled regeneration", subjects: "@Replacement", action: "Replace the main subject in @Source with @Replacement while preserving motion, timing, contact, camera, and background continuity" });
         plan.shots = [shot];
@@ -829,6 +841,11 @@ class DirectorUI {
     }
 
     promptReferences() {
+        if (this.data.settings.uiMode === "edit") {
+            const edit = this.data.edit || defaultEdit();
+            const ids = new Set([edit.sourceRefId, ...edit.replacements.filter((row) => row.target?.trim()).map((row) => row.refId)]);
+            return this.referencesFromSources([this.data.references.filter((ref) => ids.has(ref.id)).map((ref) => `@${ref.name}`).join(" "), edit.notes || ""]);
+        }
         return this.referencesFromSources(this.effectivePromptSources());
     }
 
@@ -899,10 +916,10 @@ class DirectorUI {
         }
     }
 
-    chooseMedia(type = null, refId = null, attachedAudio = false) {
-        this.pendingUpload = { type, refId, attachedAudio };
+    chooseMedia(type = null, refId = null, attachedAudio = false, replacementId = null) {
+        this.pendingUpload = { type, refId, attachedAudio, replacementId };
         this.fileInput.accept = attachedAudio ? "audio/*" : type ? `${type}/*` : "image/*,video/*,audio/*";
-        this.fileInput.multiple = !refId && !attachedAudio;
+        this.fileInput.multiple = !refId && !attachedAudio && !replacementId;
         this.host.append(this.fileInput);
         this.fileInput.click();
     }
@@ -942,18 +959,38 @@ class DirectorUI {
                     const target = this.find("ref", request.refId);
                     if (target) target.attachedAudioPath = path;
                 } else {
+                    const edit = this.data.settings.uiMode === "edit" ? this.data.edit : null;
+                    let replacement = type === "image" && edit
+                        ? request?.replacementId ? edit.replacements.find((row) => row.id === request.replacementId)
+                            : !request?.refId ? edit.replacements.find((row) => {
+                                const image = this.find("ref", row.refId);
+                                return !image || image.type !== "image" || !image.sourcePath || image.enabled === false;
+                            }) : null
+                        : null;
                     let ref = request?.refId ? this.find("ref", request.refId) : null;
+                    if (!ref && replacement) {
+                        const image = this.find("ref", replacement.refId);
+                        if (image?.type === "image" && !image.sourcePath) ref = image;
+                    }
                     if (!ref) {
                         ref = defaultReference(this.duration(), type, this.data.references.length + 1);
                         this.data.references.push(ref);
                     }
                     ref.type = type;
+                    ref.enabled = true;
                     ref.sourcePath = path;
                     ref.sourceDuration = duration;
                     ref.trimStart = 0;
                     ref.trimEnd = duration ? Math.min(duration, 15) : null;
                     ref.duration = ref.trimEnd ?? 0;
                     ref.name = ref.name.startsWith("Reference_") ? file.name.replace(/\.[^.]+$/, "").replace(/[^\w.-]+/g, "_") : ref.name;
+                    if (type === "image" && edit && (!request?.refId || request?.replacementId)) {
+                        if (!replacement) {
+                            replacement = { id: makeId("replacement"), target: "", scope: "face, hair, body proportions, clothing and accessories", characterSheet: false };
+                            edit.replacements.push(replacement);
+                        }
+                        replacement.refId = ref.id;
+                    }
                     if (type === "audio") await this.waveform(path, ref);
                     this.selection = { kind: "ref", id: ref.id };
                     this.activeRefId = ref.id;
@@ -1060,6 +1097,8 @@ class DirectorUI {
             item = shot.directionOverrides;
         }
         else if (target === "settings") item = this.data.settings;
+        else if (target === "edit") item = this.data.edit;
+        else if (target === "replacement") item = this.data.edit.replacements.find((row) => row.id === element.dataset.id);
         else if (target === "base") item = this.basePromptWidget;
         else item = this.find(target, element.dataset.id);
         if (!item || !field) return;
@@ -1068,6 +1107,10 @@ class DirectorUI {
         if (element.type === "number") value = element.hasAttribute("data-optional-number") && element.value === "" ? "" : Number(value || 0);
         if (["enabled", "cutoff", "narrationCutoff", "promptOverrideEnabled", "cameraAuto", "audioAuto", "transitionAuto"].includes(field)) value = value === true || value === "true";
         item[field === "value" ? "value" : field] = value;
+        if (target === "settings" && field === "uiMode" && value === "edit") {
+            this.data.edit ||= defaultEdit();
+            this.tab = "timeline";
+        }
         if (shotBounds) {
             const minimum = 1 / FPS;
             if (field === "start") item.start = clamp(Number(item.start || 0), shotBounds.previousEnd, Number(item.end || 0) - minimum);
@@ -1092,7 +1135,8 @@ class DirectorUI {
             if (!valid.includes(item.audioRetention)) item.audioRetention = "auto";
         }
         this.write();
-        if (["type", "pairedVideoId", "mediaMode", "frameRole", "promptMode", "uiMode", "audioMode", "speakerRefId", "directionMode", "promptOverrideEnabled", "cameraAuto", "audioAuto", "transitionAuto", "start", "end"].includes(field)) this.render();
+        if (["edit", "replacement"].includes(target) && element.tagName !== "TEXTAREA" && element.type !== "text") this.render();
+        if (["type", "pairedVideoId", "mediaMode", "frameRole", "promptMode", "uiMode", "audioMode", "speakerRefId", "directionMode", "promptOverrideEnabled", "cameraAuto", "audioAuto", "transitionAuto", "start", "end", "trimStart", "trimEnd"].includes(field)) this.render();
     }
 
     toggleAudioRole(refId, role, checked) {
@@ -1252,6 +1296,13 @@ class DirectorUI {
             + enabled.filter((ref) => ref.type === "video" && ref.mediaMode === "video_audio" && ref.attachedAudioPath).length;
         if (counts.image > 9 || counts.video > 3 || counts.audio > 3 || fileCount > 12) warnings.push("Reference limits exceeded (9 pictures / 3 videos / 3 audio / 12 files). ");
         if (this.duration() < 4 || this.duration() > 15) warnings.push("Recommended output duration is 4–15 seconds.");
+        if (this.data.settings.uiMode === "edit") {
+            const edit = this.data.edit;
+            const source = enabled.find((ref) => ref.id === edit.sourceRefId && ref.type === "video");
+            if (!source) warnings.push("请选择源视频。");
+            if (edit.replacements.some((row) => !row.target?.trim() || !enabled.some((ref) => ref.id === row.refId && ref.type === "image"))) warnings.push("请为每条人物替换选择角色图并描述原片人物。");
+            return [...new Set(warnings)];
+        }
         const shots = [...this.data.shots].sort((a, b) => Number(a.start) - Number(b.start));
         if (shots.some((shot) => Number(shot.start) < 0 || Number(shot.end) > this.duration() + 0.001)) warnings.push("A Shot extends beyond the selected output duration and will be clipped or ignored.");
         if (shots.some((shot) => shot.promptOverrideEnabled && !String(shot.promptOverride || "").trim())) warnings.push("A Shot enables external prompt override but its prompt is empty.");
@@ -1439,6 +1490,35 @@ class DirectorUI {
             <div class="h3d-simple-card-head"><b>Shot ${index + 1}</b><small>${esc(shot.title || "")}</small><span class="h3d-spacer"></span><label>Simple prompt source<select data-target="shot" data-id="${esc(shot.id)}" data-field="promptOverrideEnabled">${options([false, true], shot.promptOverrideEnabled === true, { false: "Structured simple fields", true: "External prompt override" })}</select></label><button class="danger" data-action="remove" data-kind="shot" data-id="${esc(shot.id)}">Delete</button></div>
             ${override}
         </article>`;
+    }
+
+    editView() {
+        const edit = this.data.edit;
+        const refs = this.data.references.filter((ref) => ref.enabled !== false);
+        const source = refs.find((ref) => ref.id === edit.sourceRefId && ref.type === "video");
+        const choices = (items, selected) => `<option value="">请选择…</option>` + items.map((ref) => `<option value="${esc(ref.id)}" ${ref.id === selected ? "selected" : ""}>@${esc(ref.name)}</option>`).join("");
+        const select = (field, label, values) => `<label>${label}<select data-target="edit" data-field="${field}">${values}</select></label>`;
+        const toggle = (field, label) => `<label><input type="checkbox" data-target="edit" data-field="${field}" ${edit[field] ? "checked" : ""}> ${label}</label>`;
+        const rows = edit.replacements.map((row, index) => {
+            const ref = refs.find((ref) => ref.id === row.refId && ref.type === "image");
+            return `<section class="h3d-simple-panel"><div class="h3d-row"><b>人物替换 ${index + 1}</b><span class="h3d-spacer"></span><button data-edit-remove="${esc(row.id)}">删除此替换</button></div>
+                <div class="h3d-grid"><label>替换角色图<select data-target="replacement" data-id="${esc(row.id)}" data-field="refId">${choices(refs.filter((ref) => ref.type === "image"), row.refId)}</select></label>
+                <label><input type="checkbox" data-target="replacement" data-id="${esc(row.id)}" data-field="characterSheet" ${row.characterSheet ? "checked" : ""}> 角色卡／多视图（同一人物）</label>
+                ${this.textarea("replacement", row.id, "target", "原视频中替换谁", row.target, "描述衣着、发型和首次出现的位置；需要时补充镜头中的辨认线索。")}
+                ${this.textarea("replacement", row.id, "scope", "替换哪些属性", row.scope, "例如：脸、头发、服装、配饰；身体动作沿用源视频。")}</div>
+                ${ref ? `<div class="h3d-simple-top"><div><div class="h3d-source-preview">${this.sourcePreview(ref)}</div><button data-action="upload-replacement" data-id="${esc(row.id)}">上传／替换角色图</button></div><div>${this.textarea("ref", ref.id, "description", "角色外观描述", ref.description, "描述参考图中的人物外观与服装。")}</div></div>` : `<button data-action="upload-replacement" data-id="${esc(row.id)}">上传角色图</button>`}</section>`;
+        }).join("");
+        const sound = [["dialogue", "对白／人声"], ["ambience", "环境音"], ["sfx", "音效"], ["music", "配乐"]].map(([field, label]) => `<div class="h3d-simple-panel">${select(field + "Mode", label, options(["source", "manual"], edit[field + "Mode"], { source: "沿用原视频内容", manual: "手动调整" }))}${edit[field + "Mode"] === "manual" ? this.textarea("edit", "", field, "调整说明（留空表示不生成此层）", edit[field] || "") : ""}</div>`).join("");
+        const target = Math.max(1, Math.round(this.duration() * FPS));
+        const aligned = 5 + 17 * Math.max(0, Math.ceil((target - 5) / 17));
+        return `<div class="h3d-simple-view h3d-edit-view"><section class="h3d-simple-panel"><div class="h3d-row"><b>视频编辑／人物替换</b><span class="h3d-spacer"></span><button data-action="preview-prompt">预览编译提示词</button></div>
+            <div class="h3d-grid">${select("sourceRefId", "源视频", choices(refs.filter((ref) => ref.type === "video"), edit.sourceRefId))}${toggle("followSource", "生成时长跟随源片段")}</div>
+            ${source ? `<div class="h3d-edit-source"><div><div class="h3d-source-preview h3d-edit-video-preview">${this.sourcePreview(source)}</div><button data-action="upload-ref" data-type="video" data-id="${esc(source.id)}">上传／替换源视频</button></div><div class="h3d-grid">${this.input("ref", source.id, "trimStart", "源片段开始（秒）", source.trimStart, false, "number")}${this.input("ref", source.id, "trimEnd", "源片段结束（秒）", source.trimEnd ?? source.sourceDuration, false, "number")}<label>参考音轨<select data-target="ref" data-id="${esc(source.id)}" data-field="mediaMode">${options(["video", "video_audio"], source.mediaMode, {video: "只参考画面", video_audio: "画面＋原音轨"})}</select></label></div></div>` : "<p>上传视频后，在上方选择源视频。</p>"}
+            <p>24fps目标 ${target} 帧；H3生成 ${aligned} 帧，补 ${aligned - target} 帧。最终裁帧由现有输出管线处理。</p>
+            <div class="h3d-row">${toggle("preserveMotion", "保留动作与互动")}${toggle("preserveCamera", "保留镜头与剪辑")}${toggle("preserveScene", "保留背景与灯光")}</div></section>
+            <div class="h3d-addbar"><button data-action="upload-new" data-type="video">上传源视频</button><button data-action="upload-new" data-type="image">上传角色图</button><button data-edit-add>＋添加人物替换</button></div>
+            ${rows}<section class="h3d-simple-panel"><b>声音内容</b><p>“沿用”用于指导H3生成，需提供原音轨参考；不会直接复制导出音轨。改变其中一层声音不保证其他声音能被精确分离。</p><div class="h3d-grid">${sound}</div></section>
+            <section class="h3d-simple-panel">${this.textarea("edit", "", "notes", "其他编辑要求", edit.notes, "例如保持原片画风，或描述需要调整的动作、镜头、灯光。未勾选保留不代表会自动改变。")}</section></div>`;
     }
 
     simpleView() {
@@ -2036,6 +2116,14 @@ class DirectorUI {
     }
 
     bind() {
+        this.host.querySelector("[data-edit-add]")?.addEventListener("click", () => {
+            this.data.edit.replacements.push({ id: makeId("replacement"), refId: "", target: "", scope: "face, hair, body proportions, clothing and accessories", characterSheet: false });
+            this.write(); this.render();
+        });
+        this.host.querySelectorAll("[data-edit-remove]").forEach((button) => button.addEventListener("click", () => {
+            this.data.edit.replacements = this.data.edit.replacements.filter((row) => row.id !== button.dataset.editRemove);
+            this.write(); this.render();
+        }));
         this.host.querySelector("[data-output-duration]")?.addEventListener("change", (event) => {
             this.setDuration(event.currentTarget.value);
             this.write();
@@ -2102,6 +2190,11 @@ class DirectorUI {
             else if (action === "edit-ref") { this.tab = "timeline"; this.select("ref", button.dataset.id); }
             else if (action === "move-ref") this.moveReference(button.dataset.id, Number(button.dataset.direction));
             else if (action === "upload-new") this.chooseMedia(button.dataset.type);
+            else if (action === "upload-replacement") {
+                const row = this.data.edit.replacements.find((row) => row.id === button.dataset.id);
+                const ref = this.find("ref", row?.refId);
+                this.chooseMedia("image", ref?.type === "image" ? ref.id : null, false, row.id);
+            }
             else if (action === "upload-ref") this.chooseMedia(button.dataset.type, button.dataset.id);
             else if (action === "attach-audio") this.chooseMedia("audio", button.dataset.id, true);
             else if (action === "clear-media") this.clearMedia(button.dataset.id);
@@ -2208,6 +2301,16 @@ class DirectorUI {
 
     render() {
         this.closeAliasMenu();
+        const editMode = this.data.settings.uiMode === "edit";
+        if (editMode) {
+            this.data.edit ||= defaultEdit();
+            const source = this.data.references.find((ref) => ref.id === this.data.edit.sourceRefId && ref.type === "video" && ref.enabled !== false);
+            const length = source ? Number(source.trimEnd ?? source.sourceDuration) - Number(source.trimStart || 0) : 0;
+            if (this.data.edit.followSource && length > 0 && this.durationWidget) {
+                this.durationWidget.value = length;
+                this.write();
+            }
+        }
         const warnings = this.clientWarnings();
         const enabled = this.data.references.filter((ref) => ref.enabled !== false).length;
         const uiFontSize = clamp(Number(this.data.settings.uiFontSize || 12), 10, 18);
@@ -2216,6 +2319,7 @@ class DirectorUI {
             ? `<option value="simple_single">Single-character performance</option><option value="simple_dual">Two-person dialogue</option><option value="simple_silent">Silent action</option><option value="simple_scene">Environment showcase</option><option value="simple_product">Product showcase</option><option value="simple_multi">Three-shot short</option>`
             : `<option value="performance">Character + voice performance</option><option value="motion">Identity + motion transfer</option><option value="product">Product advertisement</option><option value="remix">Video edit / replacement</option>`;
         this.host.innerHTML = `<style>
+            .h3d-edit-view label{display:flex;flex-direction:column;gap:5px}.h3d-edit-view label:has(input[type=checkbox]){flex-direction:row;align-items:center}.h3d-edit-view input[type=checkbox]{width:auto}.h3d-edit-view .h3d-row{flex-wrap:wrap}.h3d-edit-view .h3d-simple-panel{overflow-wrap:anywhere}.h3d-edit-source{display:flex;flex-direction:column;gap:10px;margin-top:8px}.h3d-edit-view .h3d-edit-video-preview{width:100%;height:clamp(260px,34vw,520px)}
             .h3d{position:relative;width:100%;height:auto;min-height:0;box-sizing:border-box;overflow:visible;background:#111419;color:#e5e7eb;font:${uiFontSize}px system-ui,sans-serif;padding:8px}.h3d *{box-sizing:border-box}.h3d button,.h3d select,.h3d input,.h3d textarea{font-family:inherit;font-size:inherit}
             .h3d-toolbar,.h3d-addbar,.h3d-inspector-head,.h3d-row{display:flex;align-items:center;gap:6px}.h3d-toolbar{position:sticky;top:0;z-index:20;background:#1d222b;border:1px solid #343c49;border-radius:8px;padding:6px;margin-bottom:8px}.h3d-font-control{display:flex;align-items:center;gap:5px;color:#aeb8c5;white-space:nowrap}.h3d-font-control select{padding:4px 6px}.h3d .h3d-font-control input{width:76px;padding:5px 6px}
             .h3d button,.h3d select{border:1px solid #465160;background:#262d38;color:#e8edf5;border-radius:5px;padding:5px 8px}.h3d button{cursor:pointer}.h3d button:hover{background:#343e4c}.h3d button.active{background:#6651a4;border-color:#a78bfa}.h3d button.danger{color:#fca5a5}.h3d-spacer{flex:1}
@@ -2242,14 +2346,14 @@ class DirectorUI {
                 <button data-tab="references" class="${this.tab === "references" ? "active" : ""}">References (${enabled})</button>
                 <button data-tab="guide" class="${this.tab === "guide" ? "active" : ""}">R2V Guide</button>
                 <button data-action="language" class="h3d-language" title="中文 / English">中 / EN</button>
-                <label class="h3d-font-control">Interface mode <select data-target="settings" data-field="uiMode">${options(["simple", "director"], simpleMode ? "simple" : "director", { simple: "Simple", director: "Director" })}</select></label>
-                <label class="h3d-font-control">Output duration (s) <input type="number" min="0.01" max="60" step="0.1" data-output-duration value="${esc(this.duration())}"></label>
+                <label class="h3d-font-control">Interface mode <select data-target="settings" data-field="uiMode">${options(["simple", "director", "edit"], this.data.settings.uiMode, { simple: "Simple", director: "Director", edit: "视频编辑／替换" })}</select></label>
+                <label class="h3d-font-control">Output duration (s) <input type="number" min="0.01" max="60" step="0.1" data-output-duration ${editMode && this.data.edit.followSource ? "disabled" : ""} value="${esc(this.duration())}"></label>
                 <label class="h3d-font-control">Font size <select data-ui-font-size>${options([10, 11, 12, 13, 14, 16, 18], uiFontSize, { 10: "10px", 11: "11px", 12: "12px", 13: "13px", 14: "14px", 16: "16px", 18: "18px" })}</select></label>
                 <span class="h3d-spacer"></span>
                 <select data-preset><option value="">Apply workflow preset…</option>${workflowPresets}</select>
                 <span class="h3d-status ${warnings.length ? "warn" : ""}" title="${esc(warnings.join("\n"))}">${warnings.length ? `⚠ ${warnings.length}` : "Ready"}</span>
             </div>
-            ${this.tab === "timeline" ? simpleMode ? this.simpleView() : this.timelineView() : this.tab === "references" ? this.referencesView() : this.guideView()}
+            ${this.tab === "timeline" ? editMode ? this.editView() : simpleMode ? this.simpleView() : this.timelineView() : this.tab === "references" ? this.referencesView() : this.guideView()}
         </div>`;
         this.localize();
         this.bind();
